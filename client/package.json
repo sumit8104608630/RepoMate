@@ -8,6 +8,12 @@
     "start": "next start",
     "lint": "eslint"
   },
+  "_allowScripts": {
+    "unrs-resolver": true,
+    "@tailwindcss/postcss": true,
+    "esbuild": true,
+    "sharp": true
+  },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
     "@shadcn/react": "^0.3.0",
