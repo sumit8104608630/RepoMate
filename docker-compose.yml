@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: devpilot-postgres
+
+    environment:
+      POSTGRES_DB: DevPilot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: sss81046
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - devpilot_pg_data:/var/lib/postgresql/data
+      - ./docker/postgres/init-extensions.sql:/docker-entrypoint-initdb.d/01-extensions.sql:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d DevPilot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  devpilot_pg_data:
