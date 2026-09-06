@@ -34,6 +34,8 @@ const LoginContent = () => {
      const params = useSearchParams();
   const router = useRouter();
   const error = params.get("error");
+  const errorDescription = params.get("error_description") || params.get("oauth_error_description");
+  const oauthError = params.get("oauth_error");
   const next = params.get("next") || "/dashboard";
   const { data: user, isLoading } = useCurrentUser();
 
@@ -73,8 +75,24 @@ const LoginContent = () => {
             {error && (
               <Alert variant="destructive">
                 <AlertCircle />
-                <AlertTitle>Sign-in failed</AlertTitle>
-                <AlertDescription>Please try again.</AlertDescription>
+                <AlertTitle>
+                  {error === "oauth_failed"
+                    ? "Sign-in failed"
+                    : error === "session"
+                    ? "Session expired"
+                    : "Sign-in error"}
+                </AlertTitle>
+                <AlertDescription>
+                  {errorDescription
+                    ? errorDescription
+                    : oauthError
+                    ? `OAuth error: ${oauthError}`
+                    : error === "oauth_failed"
+                    ? "GitHub could not complete sign-in. Check the callback URL, client ID, and secret."
+                    : error === "session"
+                    ? "Sign-in completed but the session could not be verified. Please try again."
+                    : "Please try again."}
+                </AlertDescription>
               </Alert>
             )}
 

@@ -1,5 +1,9 @@
 package devPilot.backend.config;
 
+import java.io.IOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -9,14 +13,17 @@ import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.AuthenticationException;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AuthenticationFailureHandler;
 import org.springframework.security.web.authentication.AuthenticationSuccessHandler;
 import org.springframework.security.web.authentication.HttpStatusEntryPoint;
-import org.springframework.security.web.authentication.SimpleUrlAuthenticationFailureHandler;
 import org.springframework.security.web.authentication.SimpleUrlAuthenticationSuccessHandler;
 
 import devPilot.backend.security.GithubOAuth2UserService;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 
 @Configuration
@@ -64,19 +71,41 @@ public class SecurityConfig {
         return http.build();
     }
 
+    private static String stripTrailingSlash(String url) {
+        if (url == null) return "";
+        return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+    }
+
     @Bean
     AuthenticationSuccessHandler oauth2SuccessHandler(
             @Value("${app.frontend-url}") String frontendUrl) {
         SimpleUrlAuthenticationSuccessHandler handler = new SimpleUrlAuthenticationSuccessHandler();
-        handler.setDefaultTargetUrl(frontendUrl + "/auth/callback");
+        handler.setDefaultTargetUrl(stripTrailingSlash(frontendUrl) + "/auth/callback");
         return handler;
     }
 
     @Bean
     AuthenticationFailureHandler oauth2FailureHandler(
             @Value("${app.frontend-url}") String frontendUrl) {
-        SimpleUrlAuthenticationFailureHandler handler = new SimpleUrlAuthenticationFailureHandler();
-        handler.setDefaultFailureUrl(frontendUrl + "/login?error=oauth_failed");
-        return handler;
+        return new AuthenticationFailureHandler() {
+            @Override
+            public void onAuthenticationFailure(HttpServletRequest request, HttpServletResponse response,
+                    AuthenticationException exception) throws IOException, ServletException {
+                String base = stripTrailingSlash(frontendUrl) + "/login?error=oauth_failed";
+                String message = exception != null ? exception.getMessage() : null;
+                if (message != null && !message.isBlank()) {
+                    base += "&error_description=" + URLEncoder.encode(message, StandardCharsets.UTF_8);
+                }
+                String oauthError = request.getParameter("error");
+                if (oauthError != null && !oauthError.isBlank()) {
+                    base += "&oauth_error=" + URLEncoder.encode(oauthError, StandardCharsets.UTF_8);
+                    String oauthDesc = request.getParameter("error_description");
+                    if (oauthDesc != null && !oauthDesc.isBlank()) {
+                        base += "&oauth_error_description=" + URLEncoder.encode(oauthDesc, StandardCharsets.UTF_8);
+                    }
+                }
+                response.sendRedirect(base);
+            }
+        };
     }
 }
