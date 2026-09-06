@@ -1,0 +1,77 @@
+services:
+  - type: web
+    name: devpilot-api
+    runtime: docker
+    rootDir: ./backend
+    dockerfilePath: ./Dockerfile
+    plan: standard
+    healthCheckPath: /error
+    autoDeploy: true
+    envVars:
+      - key: SPRING_PROFILES_ACTIVE
+        value: render
+      - key: DB_URL
+        fromDatabase:
+          name: devpilot-db
+          property: connectionString
+      - key: DB_USERNAME
+        fromDatabase:
+          name: devpilot-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: devpilot-db
+          property: password
+      - key: SERVER_PORT
+        value: "8081"
+      - key: SERVER_FORWARD_HEADERS_STRATEGY
+        value: native
+      - key: SERVER_SERVLET_SESSION_COOKIE_SECURE
+        value: "true"
+      - key: SERVER_SERVLET_SESSION_COOKIE_SAME_SITE
+        value: none
+      - key: APP_BASE_URL
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: APP_CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: TOKEN_ENCRYPTOR_PASSWORD
+        generateValue: true
+      - key: TOKEN_ENCRYPTOR_SALT
+        generateValue: true
+    domains:
+      - devpilot-api.onrender.com
+
+  - type: web
+    name: devpilot-client
+    runtime: node
+    rootDir: ./client
+    plan: standard
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: PORT
+        value: "3000"
+      - key: NEXT_PUBLIC_API_BASE_URL
+        sync: false
+    domains:
+      - devpilot-client.onrender.com
+
+databases:
+  - name: devpilot-db
+    plan: standard
+    databaseName: devpilot
+    postgresMajorVersion: "17"
+    postgresAdvancedFlags: "shared_preload_libraries=vector"
+    ipAllowList: []
