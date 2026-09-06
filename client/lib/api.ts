@@ -70,7 +70,7 @@ export class ApiError extends Error {
 }
 
 export function getApiBaseUrl() {
-  return process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8081";
+  return process.env.NEXT_PUBLIC_API_BASE_URL || "https://repomate-bfie.onrender.com";
 }
 
 export function getGithubLoginUrl() {
