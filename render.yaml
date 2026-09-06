@@ -33,9 +33,9 @@ services:
       - key: APP_BASE_URL
         value: https://repomate-bfie.onrender.com
       - key: FRONTEND_URL
-        sync: false
+        value: https://client-delta-gules-88.vercel.app
       - key: APP_CORS_ALLOWED_ORIGINS
-        sync: false
+        value: https://client-delta-gules-88.vercel.app
       - key: GITHUB_CLIENT_ID
         sync: false
       - key: GITHUB_CLIENT_SECRET
