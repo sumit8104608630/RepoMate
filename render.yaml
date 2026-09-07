@@ -10,6 +10,8 @@ services:
     envVars:
       - key: SPRING_PROFILES_ACTIVE
         value: render
+      - key: APP_PRODUCTION_MODE
+        value: "true"
       - key: DB_URL
         fromDatabase:
           name: devpilot-db

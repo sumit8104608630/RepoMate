@@ -23,6 +23,9 @@ import org.springframework.security.web.authentication.AuthenticationFailureHand
 import org.springframework.security.web.authentication.AuthenticationSuccessHandler;
 import org.springframework.security.web.authentication.HttpStatusEntryPoint;
 import org.springframework.security.web.authentication.SimpleUrlAuthenticationSuccessHandler;
+import org.springframework.boot.web.server.WebServerFactoryCustomizer;
+import org.springframework.boot.web.servlet.server.ConfigurableServletWebServerFactory;
+import org.springframework.boot.web.servlet.server.CookieSameSiteSupplier;
 
 import devPilot.backend.security.GithubOAuth2UserService;
 import jakarta.servlet.ServletException;
@@ -37,6 +40,21 @@ public class SecurityConfig {
 
     private final GithubOAuth2UserService gitHubOAuth2UserService;
     private final ClientRegistrationRepository clientRegistrationRepository;
+
+    @Bean
+    WebServerFactoryCustomizer<ConfigurableServletWebServerFactory> sessionCookieCustomizer(
+            @Value("${APP_PRODUCTION_MODE:false}") boolean productionMode) {
+        return factory -> {
+            factory.getSession().getCookie().setName("DEVPILOT_SESSION");
+            factory.getSession().getCookie().setHttpOnly(true);
+            if (productionMode) {
+                factory.getSession().getCookie().setSecure(true);
+                factory.addCookieSameSiteSuppliers(CookieSameSiteSupplier.ofNone());
+            } else {
+                factory.addCookieSameSiteSuppliers(CookieSameSiteSupplier.ofLax());
+            }
+        };
+    }
 
     @Bean
     SecurityFilterChain securityFilterChain(
@@ -81,8 +99,8 @@ public class SecurityConfig {
 
     @Bean
     OAuth2AuthorizationRequestResolver oauth2AuthorizationRequestResolver(
-            @Value("${APP_BASE_URL:https://repomate-bfie.onrender.com}") String appBaseUrl) {
-        String baseUrl = stripTrailingSlash(appBaseUrl);
+            @Value("${spring.security.oauth2.client.registration.github.redirect-uri}") String configuredRedirectUri) {
+        String redirectUri = stripTrailingSlash(configuredRedirectUri);
         DefaultOAuth2AuthorizationRequestResolver defaultResolver =
                 new DefaultOAuth2AuthorizationRequestResolver(
                         clientRegistrationRepository,
@@ -91,7 +109,7 @@ public class SecurityConfig {
             String registrationId = builder.build().getAttributes()
                     .get("registration_id").toString();
             if ("github".equals(registrationId)) {
-                builder.redirectUri(baseUrl + "/login/oauth2/code/github");
+                builder.redirectUri(redirectUri);
             }
         });
         return new OAuth2AuthorizationRequestResolver() {
@@ -106,7 +124,7 @@ public class SecurityConfig {
                 if (req == null) return null;
                 if ("github".equals(registrationId)) {
                     return OAuth2AuthorizationRequest.from(req)
-                            .redirectUri(baseUrl + "/login/oauth2/code/github")
+                            .redirectUri(redirectUri)
                             .build();
                 }
                 return req;
