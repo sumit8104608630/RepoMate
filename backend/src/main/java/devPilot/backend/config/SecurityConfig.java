@@ -14,6 +14,10 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.oauth2.client.registration.ClientRegistrationRepository;
+import org.springframework.security.oauth2.client.web.DefaultOAuth2AuthorizationRequestResolver;
+import org.springframework.security.oauth2.client.web.OAuth2AuthorizationRequestResolver;
+import org.springframework.security.oauth2.core.endpoint.OAuth2AuthorizationRequest;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AuthenticationFailureHandler;
 import org.springframework.security.web.authentication.AuthenticationSuccessHandler;
@@ -32,12 +36,14 @@ import lombok.RequiredArgsConstructor;
 public class SecurityConfig {
 
     private final GithubOAuth2UserService gitHubOAuth2UserService;
+    private final ClientRegistrationRepository clientRegistrationRepository;
 
     @Bean
     SecurityFilterChain securityFilterChain(
             HttpSecurity http,
             AuthenticationSuccessHandler oauth2SuccessHandler,
-            AuthenticationFailureHandler oauth2FailureHandler) throws Exception {
+            AuthenticationFailureHandler oauth2FailureHandler,
+            OAuth2AuthorizationRequestResolver oauth2AuthorizationRequestResolver) throws Exception {
         http
                 .cors(Customizer.withDefaults())
                 .csrf(csrf -> csrf.disable())
@@ -56,6 +62,8 @@ public class SecurityConfig {
                 .exceptionHandling(ex -> ex
                         .authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)))
                 .oauth2Login(oauth -> oauth
+                        .authorizationEndpoint(authEndpoint -> authEndpoint
+                                .authorizationRequestResolver(oauth2AuthorizationRequestResolver))
                         .userInfoEndpoint(userInfo -> userInfo
                                 .userService(gitHubOAuth2UserService))
                         .successHandler(oauth2SuccessHandler)
@@ -69,6 +77,41 @@ public class SecurityConfig {
                         .deleteCookies("DEVPILOT_SESSION"));
 
         return http.build();
+    }
+
+    @Bean
+    OAuth2AuthorizationRequestResolver oauth2AuthorizationRequestResolver(
+            @Value("${APP_BASE_URL:https://repomate-bfie.onrender.com}") String appBaseUrl) {
+        String baseUrl = stripTrailingSlash(appBaseUrl);
+        DefaultOAuth2AuthorizationRequestResolver defaultResolver =
+                new DefaultOAuth2AuthorizationRequestResolver(
+                        clientRegistrationRepository,
+                        "/oauth2/authorization");
+        defaultResolver.setAuthorizationRequestCustomizer(builder -> {
+            String registrationId = builder.build().getAttributes()
+                    .get("registration_id").toString();
+            if ("github".equals(registrationId)) {
+                builder.redirectUri(baseUrl + "/login/oauth2/code/github");
+            }
+        });
+        return new OAuth2AuthorizationRequestResolver() {
+            @Override
+            public OAuth2AuthorizationRequest resolve(HttpServletRequest request) {
+                return defaultResolver.resolve(request);
+            }
+
+            @Override
+            public OAuth2AuthorizationRequest resolve(HttpServletRequest request, String registrationId) {
+                OAuth2AuthorizationRequest req = defaultResolver.resolve(request, registrationId);
+                if (req == null) return null;
+                if ("github".equals(registrationId)) {
+                    return OAuth2AuthorizationRequest.from(req)
+                            .redirectUri(baseUrl + "/login/oauth2/code/github")
+                            .build();
+                }
+                return req;
+            }
+        };
     }
 
     private static String stripTrailingSlash(String url) {

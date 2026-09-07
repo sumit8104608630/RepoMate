@@ -21,7 +21,7 @@ public class AuthController {
     private final CurrentUser currentUser;
     @GetMapping("/login-url")
     public Map<String, String> loginUrl() {
-        return Map.of("url","/Oauth2/authorization/github");
+        return Map.of("url","/oauth2/authorization/github");
     }
 
 
