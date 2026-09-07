@@ -1,7 +1,5 @@
 package devPilot.backend.config;
 
-
-
 import java.util.Arrays;
 import java.util.List;
 
@@ -15,18 +13,12 @@ import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 @Configuration
 public class CorsConfig {
 
-    private static String stripTrailingSlash(String url) {
-        if (url == null) return "";
-        return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
-    }
-
     @Bean
     CorsConfigurationSource corsConfigurationSource(
             @Value("${app.cors.allowed-origins}") String allowedOrigins) {
         CorsConfiguration config = new CorsConfiguration();
         List<String> origins = Arrays.stream(allowedOrigins.split(","))
                 .map(String::trim)
-                .map(CorsConfig::stripTrailingSlash)
                 .filter(s -> !s.isEmpty())
                 .toList();
         config.setAllowedOrigins(origins);

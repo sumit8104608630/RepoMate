@@ -1,9 +1,5 @@
 package devPilot.backend.config;
 
-import java.io.IOException;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -13,24 +9,14 @@ import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
-import org.springframework.security.core.AuthenticationException;
-import org.springframework.security.oauth2.client.registration.ClientRegistrationRepository;
-import org.springframework.security.oauth2.client.web.DefaultOAuth2AuthorizationRequestResolver;
-import org.springframework.security.oauth2.client.web.OAuth2AuthorizationRequestResolver;
-import org.springframework.security.oauth2.core.endpoint.OAuth2AuthorizationRequest;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AuthenticationFailureHandler;
 import org.springframework.security.web.authentication.AuthenticationSuccessHandler;
 import org.springframework.security.web.authentication.HttpStatusEntryPoint;
+import org.springframework.security.web.authentication.SimpleUrlAuthenticationFailureHandler;
 import org.springframework.security.web.authentication.SimpleUrlAuthenticationSuccessHandler;
-import org.springframework.boot.web.server.WebServerFactoryCustomizer;
-import org.springframework.boot.web.servlet.server.ConfigurableServletWebServerFactory;
-import org.springframework.boot.web.servlet.server.CookieSameSiteSupplier;
 
 import devPilot.backend.security.GithubOAuth2UserService;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 
 @Configuration
@@ -39,29 +25,12 @@ import lombok.RequiredArgsConstructor;
 public class SecurityConfig {
 
     private final GithubOAuth2UserService gitHubOAuth2UserService;
-    private final ClientRegistrationRepository clientRegistrationRepository;
-
-    @Bean
-    WebServerFactoryCustomizer<ConfigurableServletWebServerFactory> sessionCookieCustomizer(
-            @Value("${APP_PRODUCTION_MODE:false}") boolean productionMode) {
-        return factory -> {
-            factory.getSession().getCookie().setName("DEVPILOT_SESSION");
-            factory.getSession().getCookie().setHttpOnly(true);
-            if (productionMode) {
-                factory.getSession().getCookie().setSecure(true);
-                factory.addCookieSameSiteSuppliers(CookieSameSiteSupplier.ofNone());
-            } else {
-                factory.addCookieSameSiteSuppliers(CookieSameSiteSupplier.ofLax());
-            }
-        };
-    }
 
     @Bean
     SecurityFilterChain securityFilterChain(
             HttpSecurity http,
             AuthenticationSuccessHandler oauth2SuccessHandler,
-            AuthenticationFailureHandler oauth2FailureHandler,
-            OAuth2AuthorizationRequestResolver oauth2AuthorizationRequestResolver) throws Exception {
+            AuthenticationFailureHandler oauth2FailureHandler) throws Exception {
         http
                 .cors(Customizer.withDefaults())
                 .csrf(csrf -> csrf.disable())
@@ -80,8 +49,6 @@ public class SecurityConfig {
                 .exceptionHandling(ex -> ex
                         .authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)))
                 .oauth2Login(oauth -> oauth
-                        .authorizationEndpoint(authEndpoint -> authEndpoint
-                                .authorizationRequestResolver(oauth2AuthorizationRequestResolver))
                         .userInfoEndpoint(userInfo -> userInfo
                                 .userService(gitHubOAuth2UserService))
                         .successHandler(oauth2SuccessHandler)
@@ -98,75 +65,18 @@ public class SecurityConfig {
     }
 
     @Bean
-    OAuth2AuthorizationRequestResolver oauth2AuthorizationRequestResolver(
-            @Value("${spring.security.oauth2.client.registration.github.redirect-uri}") String configuredRedirectUri) {
-        String redirectUri = stripTrailingSlash(configuredRedirectUri);
-        DefaultOAuth2AuthorizationRequestResolver defaultResolver =
-                new DefaultOAuth2AuthorizationRequestResolver(
-                        clientRegistrationRepository,
-                        "/oauth2/authorization");
-        defaultResolver.setAuthorizationRequestCustomizer(builder -> {
-            String registrationId = builder.build().getAttributes()
-                    .get("registration_id").toString();
-            if ("github".equals(registrationId)) {
-                builder.redirectUri(redirectUri);
-            }
-        });
-        return new OAuth2AuthorizationRequestResolver() {
-            @Override
-            public OAuth2AuthorizationRequest resolve(HttpServletRequest request) {
-                return defaultResolver.resolve(request);
-            }
-
-            @Override
-            public OAuth2AuthorizationRequest resolve(HttpServletRequest request, String registrationId) {
-                OAuth2AuthorizationRequest req = defaultResolver.resolve(request, registrationId);
-                if (req == null) return null;
-                if ("github".equals(registrationId)) {
-                    return OAuth2AuthorizationRequest.from(req)
-                            .redirectUri(redirectUri)
-                            .build();
-                }
-                return req;
-            }
-        };
-    }
-
-    private static String stripTrailingSlash(String url) {
-        if (url == null) return "";
-        return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
-    }
-
-    @Bean
     AuthenticationSuccessHandler oauth2SuccessHandler(
             @Value("${app.frontend-url}") String frontendUrl) {
         SimpleUrlAuthenticationSuccessHandler handler = new SimpleUrlAuthenticationSuccessHandler();
-        handler.setDefaultTargetUrl(stripTrailingSlash(frontendUrl) + "/auth/callback");
+        handler.setDefaultTargetUrl(frontendUrl + "/auth/callback");
         return handler;
     }
 
     @Bean
     AuthenticationFailureHandler oauth2FailureHandler(
             @Value("${app.frontend-url}") String frontendUrl) {
-        return new AuthenticationFailureHandler() {
-            @Override
-            public void onAuthenticationFailure(HttpServletRequest request, HttpServletResponse response,
-                    AuthenticationException exception) throws IOException, ServletException {
-                String base = stripTrailingSlash(frontendUrl) + "/login?error=oauth_failed";
-                String message = exception != null ? exception.getMessage() : null;
-                if (message != null && !message.isBlank()) {
-                    base += "&error_description=" + URLEncoder.encode(message, StandardCharsets.UTF_8);
-                }
-                String oauthError = request.getParameter("error");
-                if (oauthError != null && !oauthError.isBlank()) {
-                    base += "&oauth_error=" + URLEncoder.encode(oauthError, StandardCharsets.UTF_8);
-                    String oauthDesc = request.getParameter("error_description");
-                    if (oauthDesc != null && !oauthDesc.isBlank()) {
-                        base += "&oauth_error_description=" + URLEncoder.encode(oauthDesc, StandardCharsets.UTF_8);
-                    }
-                }
-                response.sendRedirect(base);
-            }
-        };
+        SimpleUrlAuthenticationFailureHandler handler = new SimpleUrlAuthenticationFailureHandler();
+        handler.setDefaultFailureUrl(frontendUrl + "/login?error=oauth_failed");
+        return handler;
     }
 }
