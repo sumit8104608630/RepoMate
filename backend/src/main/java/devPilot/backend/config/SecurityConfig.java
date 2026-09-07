@@ -5,6 +5,8 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.web.embedded.tomcat.TomcatServletWebServerFactory;
+import org.springframework.boot.web.server.WebServerFactoryCustomizer;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.boot.web.servlet.ServletContextInitializer;
 import org.springframework.context.annotation.Bean;
@@ -26,6 +28,7 @@ import org.springframework.security.web.authentication.AuthenticationFailureHand
 import org.springframework.security.web.authentication.AuthenticationSuccessHandler;
 import org.springframework.security.web.authentication.HttpStatusEntryPoint;
 import org.springframework.security.web.authentication.SimpleUrlAuthenticationSuccessHandler;
+import org.apache.tomcat.util.http.Rfc6265CookieProcessor;
 
 import devPilot.backend.security.GithubOAuth2UserService;
 import jakarta.servlet.Filter;
@@ -66,6 +69,19 @@ public class SecurityConfig {
                 cfg.setSecure(true);
             }
         };
+    }
+
+    @Bean
+    WebServerFactoryCustomizer<TomcatServletWebServerFactory> tomcatCookieSameSiteCustomizer(
+            @Value("${APP_PRODUCTION_MODE:false}") boolean productionMode) {
+        final String sameSiteCookies = productionMode ? "none" : "lax";
+        return factory -> factory.addContextCustomizers(context -> {
+            Rfc6265CookieProcessor processor = new Rfc6265CookieProcessor();
+            processor.setSameSiteCookies(sameSiteCookies);
+            processor.setHttpOnlySessions(true);
+            processor.setSecurePagesOnly(productionMode);
+            context.setCookieProcessor(processor);
+        });
     }
 
     @Bean
