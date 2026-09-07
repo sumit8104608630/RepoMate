@@ -1,8 +1,10 @@
 package devPilot.backend.config;
 
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
@@ -10,6 +12,7 @@ import org.springframework.boot.web.servlet.ServletContextInitializer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.Ordered;
+import org.springframework.core.env.Environment;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.config.Customizer;
@@ -31,8 +34,10 @@ import devPilot.backend.security.GithubOAuth2UserService;
 import jakarta.servlet.Filter;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
+import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.ServletRequest;
 import jakarta.servlet.ServletResponse;
+import jakarta.servlet.WriteListener;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -46,6 +51,7 @@ public class SecurityConfig {
 
     private final GithubOAuth2UserService gitHubOAuth2UserService;
     private final ClientRegistrationRepository clientRegistrationRepository;
+    private final Environment environment;
 
     private static final String SESSION_COOKIE_NAME = "DEVPILOT_SESSION";
 
@@ -54,15 +60,22 @@ public class SecurityConfig {
         return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
     }
 
+    private boolean isSecureCrossSiteMode() {
+        boolean renderProfileActive = environment.acceptsProfiles(org.springframework.core.env.Profiles.of("render"));
+        String explicit = environment.getProperty("APP_PRODUCTION_MODE", "false");
+        boolean explicitFlag = "true".equalsIgnoreCase(explicit);
+        return renderProfileActive || explicitFlag;
+    }
+
     @Bean
-    ServletContextInitializer sessionCookieContextInitializer(
-            @Value("${APP_PRODUCTION_MODE:false}") boolean productionMode) {
+    ServletContextInitializer sessionCookieContextInitializer() {
+        final boolean secureMode = isSecureCrossSiteMode();
         return servletContext -> {
             jakarta.servlet.SessionCookieConfig cfg = servletContext.getSessionCookieConfig();
             cfg.setName(SESSION_COOKIE_NAME);
             cfg.setHttpOnly(true);
             cfg.setPath("/");
-            if (productionMode) {
+            if (secureMode) {
                 cfg.setSecure(true);
             }
         };
@@ -71,16 +84,20 @@ public class SecurityConfig {
     @Bean
     FilterRegistrationBean<Filter> sessionCookieAttrsFilter(
             @Value("${APP_PRODUCTION_MODE:false}") boolean productionMode) {
-        final String sameSite = productionMode ? "None" : "Lax";
-        final boolean secure = productionMode;
+        final boolean secureMode = isSecureCrossSiteMode();
+        final String sameSite = secureMode ? "None" : "Lax";
+        final boolean secure = secureMode;
         Filter filter = new Filter() {
             @Override
             public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
                     throws IOException, ServletException {
                 HttpServletResponse response = (HttpServletResponse) res;
                 SessionCookieResponseWrapper wrapped = new SessionCookieResponseWrapper(response, sameSite, secure);
-                chain.doFilter(req, wrapped);
-                wrapped.flushHeaders();
+                try {
+                    chain.doFilter(req, wrapped);
+                } finally {
+                    wrapped.applySessionCookieRewrites();
+                }
             }
         };
         FilterRegistrationBean<Filter> reg = new FilterRegistrationBean<>(filter);
@@ -104,6 +121,8 @@ public class SecurityConfig {
     private static final class SessionCookieResponseWrapper extends HttpServletResponseWrapper {
         private final String sameSite;
         private final boolean secure;
+        private final Object lock = new Object();
+        private java.util.Set<String> sessionCookieValuesWritten = new java.util.HashSet<>();
 
         SessionCookieResponseWrapper(HttpServletResponse response, String sameSite, boolean secure) {
             super(response);
@@ -113,6 +132,31 @@ public class SecurityConfig {
 
         private boolean isSessionCookie(String headerValue) {
             return headerValue != null && headerValue.contains(SESSION_COOKIE_NAME + "=");
+        }
+
+        void applySessionCookieRewrites() {
+            synchronized (lock) {
+                var response = (HttpServletResponse) getResponse();
+                java.util.Collection<String> existing = response.getHeaders("Set-Cookie");
+                if (existing == null || existing.isEmpty()) return;
+                java.util.List<String> rewritten = new java.util.ArrayList<>(existing.size());
+                boolean changed = false;
+                for (String v : existing) {
+                    if (isSessionCookie(v)) {
+                        String r = rewriteSetCookieHeader(v, sameSite, secure);
+                        rewritten.add(r);
+                        changed = true;
+                    } else {
+                        rewritten.add(v);
+                    }
+                }
+                if (changed) {
+                    try { response.setHeader("Set-Cookie", null); } catch (Exception ignore) {}
+                    for (String v : rewritten) {
+                        response.addHeader("Set-Cookie", v);
+                    }
+                }
+            }
         }
 
         @Override
@@ -146,7 +190,90 @@ public class SecurityConfig {
             }
         }
 
-        void flushHeaders() {
+        @Override
+        public void flushBuffer() throws IOException {
+            applySessionCookieRewrites();
+            super.flushBuffer();
+        }
+
+        @Override
+        public void sendError(int sc) throws IOException {
+            applySessionCookieRewrites();
+            super.sendError(sc);
+        }
+
+        @Override
+        public void sendError(int sc, String msg) throws IOException {
+            applySessionCookieRewrites();
+            super.sendError(sc, msg);
+        }
+
+        @Override
+        public void sendRedirect(String location) throws IOException {
+            applySessionCookieRewrites();
+            super.sendRedirect(location);
+        }
+
+        @Override
+        public ServletOutputStream getOutputStream() throws IOException {
+            final ServletOutputStream delegate = super.getOutputStream();
+            return new ServletOutputStream() {
+                @Override
+                public boolean isReady() { return delegate.isReady(); }
+                @Override
+                public void setWriteListener(WriteListener writeListener) { delegate.setWriteListener(writeListener); }
+                @Override
+                public void write(int b) throws IOException { delegate.write(b); }
+                @Override
+                public void write(byte[] b) throws IOException { delegate.write(b); }
+                @Override
+                public void write(byte[] b, int off, int len) throws IOException { delegate.write(b, off, len); }
+                @Override
+                public void flush() throws IOException {
+                    applySessionCookieRewrites();
+                    delegate.flush();
+                }
+                @Override
+                public void close() throws IOException {
+                    applySessionCookieRewrites();
+                    delegate.close();
+                }
+            };
+        }
+
+        @Override
+        public PrintWriter getWriter() throws IOException {
+            final PrintWriter delegate = super.getWriter();
+            return new PrintWriter(delegate) {
+                @Override
+                public void flush() {
+                    applySessionCookieRewrites();
+                    delegate.flush();
+                }
+                @Override
+                public void close() {
+                    applySessionCookieRewrites();
+                    delegate.close();
+                }
+            };
+        }
+
+        @Override
+        public void setStatus(int sc) {
+            applySessionCookieRewrites();
+            super.setStatus(sc);
+        }
+
+        @Override
+        public void setLocale(Locale loc) {
+            applySessionCookieRewrites();
+            super.setLocale(loc);
+        }
+
+        @Override
+        public void reset() {
+            super.reset();
+            synchronized (lock) { sessionCookieValuesWritten.clear(); }
         }
 
         private static String buildSetCookieHeader(Cookie c, String sameSite, boolean secure) {
