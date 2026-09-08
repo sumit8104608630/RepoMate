@@ -51,7 +51,6 @@ public class ChatStreamHandler {
                 try {
                     emitter.complete();
                 } catch (Exception ignored) {
-                    // emitter already closed
                 }
             }
         };
@@ -64,12 +63,10 @@ public class ChatStreamHandler {
                             .data(java.util.Collections.singletonMap("message", message),
                                     org.springframework.http.MediaType.APPLICATION_JSON));
                 } catch (Exception ignored) {
-                    // emit error best-effort; if socket is gone there is nothing we can do
                 }
                 try {
                     emitter.completeWithError(err instanceof Exception ex ? ex : new RuntimeException(err));
                 } catch (Exception ignored) {
-                    // emitter already closed
                 }
             }
         };
@@ -111,6 +108,90 @@ public class ChatStreamHandler {
                         );
             } catch (Exception ex) {
                 log.error("Failed to start chat stream, session={}", sessionId, ex);
+                failWith.accept(ex);
+            }
+        });
+
+        return emitter;
+    }
+
+    /**
+     * Emit a canned (non-LLM) assistant reply over SSE.
+     *
+     * <p>Used for deterministic responses like greetings and out-of-domain fallbacks
+     * where we don't want to spend tokens or rely on LLM mood to reproduce the exact
+     * required phrase. The event order matches {@link #stream}: user_message, token
+     * bursts, assistant_message (persisted), done.</p>
+     */
+    public SseEmitter sendFixedReply(
+            UUID sessionId,
+            ChatMessageResponse savedUserMessage,
+            List<CitationDto> citations,
+            String fixedReply) {
+
+        SseEmitter emitter = new SseEmitter(RagSettings.STREAM_TIMEOUT_MS);
+        AtomicBoolean finished = new AtomicBoolean(false);
+        String reply = fixedReply == null ? "" : fixedReply;
+
+        Runnable finish = () -> {
+            if (finished.compareAndSet(false, true)) {
+                try { emitter.complete(); } catch (Exception ignored) {}
+            }
+        };
+        java.util.function.Consumer<Throwable> failWith = (err) -> {
+            if (finished.compareAndSet(false, true)) {
+                try {
+                    safeSend(emitter, SseEmitter.event()
+                            .name("error")
+                            .data(java.util.Collections.singletonMap("message", extractUserMessage(err)),
+                                    org.springframework.http.MediaType.APPLICATION_JSON));
+                } catch (Exception ignored) {}
+                try {
+                    emitter.completeWithError(err instanceof Exception ex ? ex : new RuntimeException(err));
+                } catch (Exception ignored) {}
+            }
+        };
+
+        emitter.onCompletion(() -> finished.set(true));
+        emitter.onTimeout(() -> failWith.accept(new java.util.concurrent.TimeoutException("Stream timed out")));
+        emitter.onError((ex) -> finished.set(true));
+
+        try {
+            safeSend(emitter, SseEmitter.event().name("user_message").data(savedUserMessage));
+        } catch (Exception ex) {
+            log.warn("Could not send user_message SSE event, session={}", sessionId, ex);
+            failWith.accept(ex);
+            return emitter;
+        }
+
+        streamExecutor.execute(() -> {
+            try {
+                StringBuilder fullReply = new StringBuilder();
+                for (int i = 0; i < reply.length(); i++) {
+                    String token = String.valueOf(reply.charAt(i));
+                    fullReply.append(token);
+                    try {
+                        safeSend(emitter, SseEmitter.event()
+                                .name("token")
+                                .data(token, MediaType.APPLICATION_JSON));
+                    } catch (IOException ex) {
+                        log.debug("Token send failed (client disconnected): {}", ex.toString());
+                        failWith.accept(ex);
+                        return;
+                    }
+                }
+                String content = fullReply.toString();
+                ChatMessage assistant = chatMessageRepository.save(ChatMessage.builder()
+                        .sessionId(sessionId)
+                        .role(MessageRole.ASSISTANT)
+                        .content(content)
+                        .citations(citationMapper.toJson(citations == null ? List.of() : citations))
+                        .build());
+                safeSend(emitter, SseEmitter.event().name("assistant_message").data(toMessageResponse(assistant)));
+                safeSend(emitter, SseEmitter.event().name("done").data("[DONE]"));
+                finish.run();
+            } catch (Exception ex) {
+                log.error("Fixed-reply stream failed, session={}", sessionId, ex);
                 failWith.accept(ex);
             }
         });
