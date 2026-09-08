@@ -6,6 +6,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
@@ -28,9 +30,11 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.util.StringUtils;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClient;
 
 import reactor.core.publisher.Flux;
@@ -38,8 +42,52 @@ import reactor.core.publisher.Flux;
 @Configuration
 public class AiConfig {
 
+    private static final Logger log = LoggerFactory.getLogger(AiConfig.class);
+
     private static final String DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small";
     private static final int DEFAULT_EMBEDDING_DIMENSIONS = 1536;
+
+    private static String mask(String key) {
+        if (key == null || key.isEmpty()) return "<EMPTY>";
+        if (key.length() <= 14) return key.substring(0, Math.min(4, key.length())) + "…";
+        return key.substring(0, 10) + "…" + key.substring(key.length() - 4);
+    }
+
+    private static String resolveApiKey(String propertyKey) {
+        String key = propertyKey == null ? "" : propertyKey.trim();
+        if (!key.isEmpty() && !key.startsWith("${")) {
+            log.info("OPENROUTER_API_KEY resolved via Spring property spring.ai.openai.api-key; prefix={}", mask(key));
+            return key;
+        }
+        String env = System.getenv("OPENROUTER_API_KEY");
+        if (env != null && !env.isBlank()) {
+            log.info("OPENROUTER_API_KEY resolved via direct System.getenv(OPENROUTER_API_KEY); prefix={}", mask(env));
+            return env.trim();
+        }
+        log.warn("OPENROUTER_API_KEY is EMPTY. Embeddings and chat will fail with 401 from OpenRouter. "
+                + "Set env OPENROUTER_API_KEY or property spring.ai.openai.api-key on Render.");
+        return "";
+    }
+
+    private static void validateKey(String key, String model) {
+        if (key == null || key.isEmpty()) {
+            log.error("OpenRouter key configuration is EMPTY. Embedding/chat calls will fail.");
+            return;
+        }
+        if (!key.startsWith("sk-or-v1-")) {
+            log.warn("OpenRouter key does not start with 'sk-or-v1-' (got prefix '{}'). "
+                    + "OpenRouter standard keys use this prefix. Verify the Render env OPENROUTER_API_KEY value.",
+                    key.length() >= 10 ? key.substring(0, 10) : key);
+        } else {
+            log.info("OpenRouter key format looks valid (sk-or-v1-…). Model for embeddings/chat: {}", model);
+        }
+        log.info("Quick curl smoke-test (run from Render shell / your terminal to rule out key-type issues):\n"
+                + "  curl -sS -H \"Authorization: Bearer $OPENROUTER_API_KEY\" https://openrouter.ai/api/v1/models | head -c 400\n"
+                + "  If this also returns 401 {{\"error\":{\"message\":\"User not found.\",\"code\":401}} then the key itself is bad:\n"
+                + "    - Go to https://openrouter.ai/settings/keys and click \"Create Key\" under the standard API Keys section (NOT the Provisioning tab).\n"
+                + "    - Provisioning/management keys return 401 User not found for ALL chat/embedding calls even though they share the sk-or-v1- format.\n"
+                + "    - Expired standard keys also return this misleading 401 instead of 'Key expired'.");
+    }
 
     @Bean(name = "openRouterRestClient")
     RestClient openRouterRestClient(
@@ -47,9 +95,14 @@ public class AiConfig {
             @Value("${spring.ai.openai.api-key:}") String apiKey,
             @Value("${app.openrouter.referer:https://repomate-bfie.onrender.com}") String referer,
             @Value("${app.openrouter.title:DevPilot}") String title) {
+        String resolvedKey = resolveApiKey(apiKey);
+        String trimmedBase = StringUtils.trimTrailingCharacter(baseUrl, '/');
+        log.info("OpenRouter RestClient: baseUrl={}, referer={}, title={}, keyPrefix={}",
+                trimmedBase, referer, title, mask(resolvedKey));
+        validateKey(resolvedKey, DEFAULT_EMBEDDING_MODEL + " / openai/gpt-4o-mini");
         return RestClient.builder()
-                .baseUrl(StringUtils.trimTrailingCharacter(baseUrl, '/'))
-                .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
+                .baseUrl(trimmedBase)
+                .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + resolvedKey)
                 .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
                 .defaultHeader("HTTP-Referer", referer)
                 .defaultHeader("X-Title", title)
@@ -63,6 +116,7 @@ public class AiConfig {
             RestClient openRouterRestClient,
             @Value("${spring.ai.openai.embedding.options.model:" + DEFAULT_EMBEDDING_MODEL + "}") String model,
             @Value("${spring.ai.openai.embedding.options.dimensions:" + DEFAULT_EMBEDDING_DIMENSIONS + "}") int dimensions) {
+        log.info("Registering @Primary OpenRouterEmbeddingModel: model={}, dimensions={}", model, dimensions);
         return new OpenRouterEmbeddingModel(openRouterRestClient, model, dimensions);
     }
 
@@ -72,7 +126,28 @@ public class AiConfig {
             RestClient openRouterRestClient,
             @Value("${spring.ai.openai.chat.options.model:openai/gpt-4o-mini}") String model,
             @Value("${spring.ai.openai.chat.options.temperature:0.2}") double temperature) {
+        log.info("Registering @Primary OpenRouterChatModel: model={}, temperature={}", model, temperature);
         return new OpenRouterChatModel(openRouterRestClient, model, temperature);
+    }
+
+    private static RuntimeException translateOpenRouter(HttpClientErrorException ex, String endpoint) {
+        String body = ex.getResponseBodyAsString();
+        HttpStatus status = HttpStatus.resolve(ex.getStatusCode().value());
+        if (status == HttpStatus.UNAUTHORIZED && (body.contains("User not found") || body.contains("\"code\":401"))) {
+            String msg = "OpenRouter returned 401 'User not found' on " + endpoint
+                    + ". This is a KEY TYPE / KEY VALIDITY issue, not a code bug. Fix by:\n"
+                    + "  (1) Verify Render env OPENROUTER_API_KEY uses a STANDARD key created at https://openrouter.ai/settings/keys\n"
+                    + "      via the 'Create Key' button at the top of the page — NOT the Provisioning / management keys section.\n"
+                    + "      Provisioning keys use the same sk-or-v1- format but always return 401 for chat/embedding calls.\n"
+                    + "  (2) If the key is standard, it may be EXPIRED (OpenRouter returns 'User not found' instead of 'Key expired').\n"
+                    + "      Create a new standard key at the dashboard and replace OPENROUTER_API_KEY in Render.\n"
+                    + "  (3) Validate by running: curl -sS -H \"Authorization: Bearer $OPENROUTER_API_KEY\" https://openrouter.ai/api/v1/models\n"
+                    + "      Expected: JSON model list. If you see 401 User not found, the key is invalid regardless of DevPilot.\n"
+                    + "  Raw body: " + body;
+            log.error(msg);
+            return new RuntimeException(msg, ex);
+        }
+        return ex;
     }
 
     @SuppressWarnings("unchecked")
@@ -96,11 +171,16 @@ public class AiConfig {
             body.put("input", inputs.size() == 1 ? inputs.get(0) : inputs);
             body.put("dimensions", dimensions);
 
-            Map<String, Object> payload = client.post()
-                    .uri("/embeddings")
-                    .body(body)
-                    .retrieve()
-                    .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+            Map<String, Object> payload;
+            try {
+                payload = client.post()
+                        .uri("/embeddings")
+                        .body(body)
+                        .retrieve()
+                        .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+            } catch (HttpClientErrorException ex) {
+                throw translateOpenRouter(ex, "POST /embeddings (model=" + model + ")");
+            }
 
             List<Object> data = (List<Object>) payload.get("data");
             List<Embedding> embeddings = new ArrayList<>(data.size());
@@ -224,11 +304,16 @@ public class AiConfig {
                 body.put("stop", stops.size() == 1 ? stops.get(0) : stops);
             }
 
-            Map<String, Object> payload = client.post()
-                    .uri("/chat/completions")
-                    .body(body)
-                    .retrieve()
-                    .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+            Map<String, Object> payload;
+            try {
+                payload = client.post()
+                        .uri("/chat/completions")
+                        .body(body)
+                        .retrieve()
+                        .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+            } catch (HttpClientErrorException ex) {
+                throw translateOpenRouter(ex, "POST /chat/completions (model=" + model + ")");
+            }
 
             List<Object> choices = (List<Object>) payload.getOrDefault("choices", List.of());
             List<Generation> generations = new ArrayList<>(choices.size());
