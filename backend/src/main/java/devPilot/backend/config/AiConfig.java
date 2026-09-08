@@ -125,9 +125,10 @@ public class AiConfig {
     ChatModel openRouterChatModel(
             RestClient openRouterRestClient,
             @Value("${spring.ai.openai.chat.options.model:openai/gpt-4o-mini}") String model,
-            @Value("${spring.ai.openai.chat.options.temperature:0.2}") double temperature) {
-        log.info("Registering @Primary OpenRouterChatModel: model={}, temperature={}", model, temperature);
-        return new OpenRouterChatModel(openRouterRestClient, model, temperature);
+            @Value("${spring.ai.openai.chat.options.temperature:0.2}") double temperature,
+            @Value("${spring.ai.openai.chat.options.max-tokens:4096}") int maxTokens) {
+        log.info("Registering @Primary OpenRouterChatModel: model={}, temperature={}, maxTokens={}", model, temperature, maxTokens);
+        return new OpenRouterChatModel(openRouterRestClient, model, temperature, maxTokens);
     }
 
     private static RuntimeException translateOpenRouter(HttpClientErrorException ex, String endpoint) {
@@ -230,11 +231,13 @@ public class AiConfig {
         private final RestClient client;
         private final String model;
         private final double temperature;
+        private final int maxTokens;
 
-        OpenRouterChatModel(RestClient client, String model, double temperature) {
+        OpenRouterChatModel(RestClient client, String model, double temperature, int maxTokens) {
             this.client = client;
             this.model = model;
             this.temperature = temperature;
+            this.maxTokens = maxTokens;
         }
 
         private static String messageText(Message m) {
@@ -296,9 +299,11 @@ public class AiConfig {
             body.put("temperature", BigDecimal.valueOf(temperature));
             body.put("stream", false);
             ChatOptions options = prompt.getOptions();
+            int capped = maxTokens;
             if (options != null && options.getMaxTokens() != null) {
-                body.put("max_tokens", options.getMaxTokens());
+                capped = Math.min(options.getMaxTokens(), maxTokens);
             }
+            body.put("max_tokens", capped);
             if (options != null && options.getStopSequences() != null && !options.getStopSequences().isEmpty()) {
                 List<String> stops = options.getStopSequences();
                 body.put("stop", stops.size() == 1 ? stops.get(0) : stops);
