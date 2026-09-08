@@ -40,7 +40,7 @@ import lombok.RequiredArgsConstructor;
 public class ChatService {
 
     /** Exact greeting response the user requires. */
-    private static final String GREETING_REPLY = "hii iam repomate how ca i help you";
+    private static final String GREETING_REPLY = "hii iam repomate how can i help you";
 
     /** Exact out-of-domain response the user requires. */
     private static final String OUT_OF_DOMAIN_REPLY = "it is out of domain";
