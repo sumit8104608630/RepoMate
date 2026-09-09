@@ -1,7 +1,6 @@
 package devPilot.backend.services.indexing;
 
 import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
 
 import org.springframework.stereotype.Component;
@@ -43,53 +42,6 @@ public class CodeFileFilter {
             "composer.lock",
             "cargo.lock",
             "poetry.lock");
-
-    private static final Map<String, String> COMMENT_PREFIXES = Map.ofEntries(
-            Map.entry("java", "//"),
-            Map.entry("kt", "//"),
-            Map.entry("kts", "//"),
-            Map.entry("scala", "//"),
-            Map.entry("ts", "//"),
-            Map.entry("tsx", "//"),
-            Map.entry("js", "//"),
-            Map.entry("jsx", "//"),
-            Map.entry("mjs", "//"),
-            Map.entry("cjs", "//"),
-            Map.entry("go", "//"),
-            Map.entry("rs", "//"),
-            Map.entry("php", "//"),
-            Map.entry("c", "//"),
-            Map.entry("h", "//"),
-            Map.entry("cpp", "//"),
-            Map.entry("hpp", "//"),
-            Map.entry("cs", "//"),
-            Map.entry("swift", "//"),
-            Map.entry("m", "//"),
-            Map.entry("mm", "//"),
-            Map.entry("vue", "//"),
-            Map.entry("svelte", "//"),
-            Map.entry("py", "#"),
-            Map.entry("rb", "#"),
-            Map.entry("yml", "#"),
-            Map.entry("yaml", "#"),
-            Map.entry("toml", "#"),
-            Map.entry("sh", "#"),
-            Map.entry("bash", "#"),
-            Map.entry("zsh", "#"),
-            Map.entry("dockerfile", "#"),
-            Map.entry("makefile", "#"),
-            Map.entry("properties", "#"),
-            Map.entry("gradle", "//"),
-            Map.entry("sql", "--"),
-            Map.entry("xml", "<!--"),
-            Map.entry("html", "<!--"),
-            Map.entry("md", "<!--"),
-            Map.entry("mdx", "<!--"),
-            Map.entry("css", "/*"),
-            Map.entry("scss", "/*"),
-            Map.entry("sass", "/*"),
-            Map.entry("txt", "#"),
-            Map.entry("json", "//"));
 // backend\src\main\java\devPilot\backend\repository\filename.java
     public boolean isEligible(String path, long sizeBytes, long maxFileBytes) {
         if (path == null || path.isBlank()) {
@@ -127,7 +79,7 @@ public class CodeFileFilter {
         return ALLOWED_EXTENSIONS.contains(ext);
     }
 
-    public String detectLanguage(String path) {
+ public String detectLanguage(String path) {
         String lower = path.toLowerCase(Locale.ROOT);
         String fileName = lower.substring(lower.lastIndexOf('/') + 1);
         if ("dockerfile".equals(fileName)) {
@@ -141,12 +93,5 @@ public class CodeFileFilter {
             return "text";
         }
         return fileName.substring(dot + 1);
-    }
-
-    public String commentPrefixFor(String language) {
-        if (language == null) {
-            return "//";
-        }
-        return COMMENT_PREFIXES.getOrDefault(language.toLowerCase(Locale.ROOT), "//");
     }
 }

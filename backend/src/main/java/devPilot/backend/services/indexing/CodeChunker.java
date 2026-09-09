@@ -36,8 +36,7 @@ public class CodeChunker {
         }
 
         String language = fileFilter.detectLanguage(filePath);
-        String prefix = fileFilter.commentPrefixFor(language);
-        String header = prefix + " File: " + filePath + "\n";
+        String header = "// File: " + filePath + "\n";
 
         Document source = new Document(header + content, baseMetadata(repoId, filePath, language));
         List<Document> split = splitter.apply(List.of(source));
