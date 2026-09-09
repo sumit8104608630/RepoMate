@@ -26,4 +26,15 @@ public class AppConfig {
         executor.initialize();
         return executor;
     }
+
+    @Bean(name = "streamExecutor")
+    Executor streamExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(16);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("chatstream-");
+        executor.initialize();
+        return executor;
+    }
 }
