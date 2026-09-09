@@ -26,6 +26,8 @@ import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+import org.springframework.jdbc.core.JdbcTemplate;
+
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -40,6 +42,7 @@ public class IndexingService {
     private final CodeChunker codeChunker;
     private final GitHubRateLimiter rateLimiter;
     private final VectorStore vectorStore;
+    private final JdbcTemplate jdbcTemplate;
 
     @Value("${app.indexing.max-file-bytes:102400}")
     private long maxFileBytes;
@@ -120,7 +123,7 @@ public class IndexingService {
                 batch.addAll(chunks);
                 totalChunks += chunks.size();
                 if (batch.size() >= VECTOR_BATCH_SIZE) {
-                    vectorStore.add(batch);
+                    persistBatch(batch);
                     batch.clear();
                 }
             } catch (Exception ex) {
@@ -135,7 +138,7 @@ public class IndexingService {
         }
 
         if (!batch.isEmpty()) {
-            vectorStore.add(batch);
+            persistBatch(batch);
         }
 
         markReady(repoId, filePaths.size(), processed, totalChunks, repo.getFullName());
@@ -187,8 +190,7 @@ public class IndexingService {
         });
     }
 
-    @Transactional
-    protected void markReady(UUID repoId, int totalFiles, int processedFiles, int totalChunks, String fullName) {
+    private void markReady(UUID repoId, int totalFiles, int processedFiles, int totalChunks, String fullName) {
         repositoryRepository.findById(repoId).ifPresent(repo -> {
             repo.setIndexStatus(IndexStatus.READY);
             repo.setFilesTotal(totalFiles);
@@ -200,6 +202,70 @@ public class IndexingService {
             repositoryRepository.save(repo);
         });
         log.info("Indexed {} files ({} chunks) for {}", processedFiles, totalChunks, fullName);
+    }
+
+    /**
+     * Writes a batch of Document chunks to the VectorStore and immediately
+     * verifies via direct JDBC that the TEXT content column is not NULL for
+     * at least one of the inserted IDs. If content is NULL for all rows we
+     * fail fast with a clear log message — otherwise the user would only
+     * discover this later as a silent "out of domain" at chat time.
+     */
+    private void persistBatch(List<Document> batch) {
+        if (batch == null || batch.isEmpty()) return;
+
+        List<String> preIds = batch.stream()
+                .map(Document::getId)
+                .filter(java.util.Objects::nonNull)
+                .map(Object::toString)
+                .toList();
+
+        vectorStore.add(batch);
+
+        List<String> ids = preIds.isEmpty()
+                ? batch.stream().map(Document::getId).filter(java.util.Objects::nonNull).map(Object::toString).toList()
+                : preIds;
+
+        if (ids.isEmpty()) {
+            log.warn("persistBatch: VectorStore returned no Document IDs; cannot verify content column via JDBC.");
+            return;
+        }
+
+        try {
+            String placeholders = ids.stream().map(i -> "?").collect(java.util.stream.Collectors.joining(","));
+            String sql = "SELECT COUNT(*) AS n, COUNT(content) AS with_content " +
+                         "FROM public.vector_store WHERE id IN (" + placeholders + ")";
+            jdbcTemplate.query(sql, rs -> {
+                int n = rs.getInt(1);
+                int withContent = rs.getInt(2);
+                if (n == 0) {
+                    log.error("persistBatch: POST-INSERT VERIFICATION FAILED. vectorStore.add() returned, " +
+                            "but JDBC SELECT found 0 rows for the {} IDs we asked for. " +
+                            "Row mapping / id-column-name mismatch. Content will be lost.", ids.size());
+                    throw new RuntimeException("VectorStore persistBatch verification: rows not found after add()");
+                }
+                if (withContent == 0) {
+                    log.error(
+                        "================================================================================\n" +
+                        "persistBatch: POST-INSERT VERIFICATION FAILED.\n" +
+                        "  Rows inserted: {} / {}\n" +
+                        "  Rows with non-NULL content column: **0**\n" +
+                        "This means PgVectorStore is writing embedding + metadata but NOT the content TEXT column.\n" +
+                        "Most likely cause: content-column-name mismatch between the migration and Spring AI autoconfig.\n" +
+                        "Ensure spring.ai.vectorstore.pgvector.content-column-name=content matches the schema.\n" +
+                        "================================================================================\n",
+                        n, ids.size());
+                    throw new RuntimeException("VectorStore content column is NULL after insert — check column mapping.");
+                }
+                double pct = 100.0 * withContent / n;
+                log.info("persistBatch: verified {} / {} rows ({}) with non-NULL content column.",
+                        withContent, n, String.format("%.1f%%", pct));
+            }, ids.toArray());
+        } catch (RuntimeException rtex) {
+            throw rtex;
+        } catch (Exception ex) {
+            log.warn("persistBatch: post-write verification query failed (non-fatal): {}", ex.toString());
+        }
     }
 
     @Transactional
