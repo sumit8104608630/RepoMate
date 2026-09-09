@@ -11,8 +11,8 @@ public class CryptoConfig {
 
     @Bean
     TextEncryptor tokenEncryptor(
-            @Value("${app.token-encryptor-password}") String password,
-            @Value("${app.token-encryptor-salt}") String salt) {
+            @Value("${app.token-encryptor.password}") String password,
+            @Value("${app.token-encryptor.salt}") String salt) {
         return Encryptors.text(password, salt);
     }
 }
