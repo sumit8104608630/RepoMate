@@ -66,10 +66,17 @@ public class ChatStreamHandler {
             String userPrompt) {
 
         SseEmitter emitter = new SseEmitter(RagSettings.STREAM_TIMEOUT_MS);
+        emitter.onTimeout(() -> {
+            log.warn("ChatStreamHandler.stream: SSE emitter timeout for session={}", sessionId);
+            sendErrorThenComplete(emitter, new RuntimeException("Response timed out"));
+        });
+        emitter.onError(t -> log.warn("ChatStreamHandler.stream: SSE emitter error for session={}: {}", sessionId, t.toString()));
+        emitter.onCompletion(() -> log.debug("ChatStreamHandler.stream: SSE emitter completed for session={}", sessionId));
 
         Runnable work = () -> {
             StringBuilder fullReply = new StringBuilder();
             try {
+                log.info("ChatStreamHandler.stream: sending user_message event, session={}", sessionId);
                 emitter.send(SseEmitter.event()
                         .name("user_message")
                         .data(savedUserMessage));
@@ -78,24 +85,68 @@ public class ChatStreamHandler {
                         new SystemMessage(systemPrompt),
                         new UserMessage(userPrompt));
                 Prompt prompt = new Prompt(messages);
+
+                log.info("ChatStreamHandler.stream: calling chatModel.call(), session={}, systemPromptLen={}, userPromptLen={}",
+                        sessionId, systemPrompt.length(), userPrompt.length());
                 ChatResponse response = chatModel.call(prompt);
-                String raw = response.getResults().isEmpty()
-                        ? ""
-                        : response.getResults().get(0).getOutput().getText();
+
+                String raw = "";
+                if (response != null && response.getResults() != null && !response.getResults().isEmpty()) {
+                    var outputMessage = response.getResults().get(0).getOutput();
+                    raw = extractMessageText(outputMessage);
+                    log.info("ChatStreamHandler.stream: received response, resultCount={}, firstResultTextLen={}, session={}",
+                            response.getResults().size(), raw == null ? 0 : raw.length(), sessionId);
+                } else {
+                    log.warn("ChatStreamHandler.stream: chatModel.call returned empty/null results, session={}", sessionId);
+                }
 
                 if (raw == null || raw.isBlank()) {
                     raw = "(no response from the model)";
                 }
 
                 emitCharactersGradually(emitter, fullReply, raw);
+                log.info("ChatStreamHandler.stream: completing stream, replyLen={}, session={}", fullReply.length(), sessionId);
                 completeStream(emitter, sessionId, fullReply, citations);
             } catch (Exception ex) {
-                log.error("Chat stream error", ex);
+                log.error("ChatStreamHandler.stream: error during stream work, session={}", sessionId, ex);
                 sendErrorThenComplete(emitter, ex);
             }
         };
         submitOrRunDirect(work, "stream(LLM)");
         return emitter;
+    }
+
+    /**
+     * Safely extracts text from a Spring AI Message, trying multiple accessors
+     * because the API has been inconsistent across versions (getContent vs getText).
+     */
+    static String extractMessageText(org.springframework.ai.chat.messages.Message m) {
+        if (m == null) return "";
+        try {
+            java.lang.reflect.Method mGet = m.getClass().getMethod("getContent");
+            Object v = mGet.invoke(m);
+            if (v != null && !v.toString().isBlank()) return v.toString();
+        } catch (NoSuchMethodException ignored) {
+        } catch (Exception ignored) {}
+        try {
+            java.lang.reflect.Method mGet = m.getClass().getMethod("getText");
+            Object v = mGet.invoke(m);
+            if (v != null && !v.toString().isBlank()) return v.toString();
+        } catch (NoSuchMethodException ignored) {
+        } catch (Exception ignored) {}
+        try {
+            java.lang.reflect.Field f = m.getClass().getDeclaredField("content");
+            f.setAccessible(true);
+            Object v = f.get(m);
+            if (v != null && !v.toString().isBlank()) return v.toString();
+        } catch (Exception ignored) {}
+        try {
+            java.lang.reflect.Field f = m.getClass().getSuperclass().getDeclaredField("content");
+            f.setAccessible(true);
+            Object v = f.get(m);
+            if (v != null && !v.toString().isBlank()) return v.toString();
+        } catch (Exception ignored) {}
+        return "";
     }
 
     /**
@@ -139,10 +190,17 @@ public class ChatStreamHandler {
             String reply) {
 
         SseEmitter emitter = new SseEmitter(RagSettings.STREAM_TIMEOUT_MS);
+        emitter.onTimeout(() -> {
+            log.warn("ChatStreamHandler.sendFixedReply: SSE emitter timeout for session={}", sessionId);
+            sendErrorThenComplete(emitter, new RuntimeException("Response timed out"));
+        });
+        emitter.onError(t -> log.warn("ChatStreamHandler.sendFixedReply: SSE emitter error for session={}: {}", sessionId, t.toString()));
+        emitter.onCompletion(() -> log.debug("ChatStreamHandler.sendFixedReply: SSE emitter completed for session={}", sessionId));
 
         Runnable work = () -> {
             StringBuilder fullReply = new StringBuilder();
             try {
+                log.info("ChatStreamHandler.sendFixedReply: session={}, replyLen={}", sessionId, reply.length());
                 emitter.send(SseEmitter.event().name("user_message").data(savedUserMessage));
                 // Character-by-character token emission so the UI animates identically to
                 // real LLM streams. Clients expect incremental "token" events.
@@ -151,6 +209,7 @@ public class ChatStreamHandler {
                 }
                 completeStream(emitter, sessionId, fullReply, citations);
             } catch (Exception ex) {
+                log.error("ChatStreamHandler.sendFixedReply: error during work, session={}", sessionId, ex);
                 sendErrorThenComplete(emitter, ex);
             }
         };

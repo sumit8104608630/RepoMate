@@ -128,28 +128,36 @@ public class ChatService {
                     session.getId(), savedUserResponse, List.of(), GREETING_REPLY);
         }
 
-        // 4. RAG retrieval — find code chunks similar to the question
-        var retrievedContext = codeContextRetriever.retrieve(repo.getId(), userContent);
+        try {
+            // 4. RAG retrieval — find code chunks similar to the question
+            var retrievedContext = codeContextRetriever.retrieve(repo.getId(), userContent);
 
-        // 5. Out-of-domain short-circuit — no matching code → canned answer, no LLM call
-        if (retrievedContext.contextText() == null
-                || retrievedContext.contextText().isBlank()
-                || NO_MATCHES.equals(retrievedContext.contextText())) {
+            // 5. Out-of-domain short-circuit — no matching code → canned answer, no LLM call
+            if (retrievedContext.contextText() == null
+                    || retrievedContext.contextText().isBlank()
+                    || NO_MATCHES.equals(retrievedContext.contextText())) {
+                return chatStreamHandler.sendFixedReply(
+                        session.getId(), savedUserResponse, List.of(), OUT_OF_DOMAIN_REPLY);
+            }
+
+            // 6. Build LLM prompts from retrieved context + question
+            String systemPrompt = chatPromptBuilder.systemPrompt(repo.getFullName());
+            String userPrompt = chatPromptBuilder.userPrompt(retrievedContext.contextText(), userContent);
+
+            // 7. Stream LLM response to the client (SSE)
+            return chatStreamHandler.stream(
+                    session.getId(),
+                    savedUserResponse,
+                    retrievedContext.citations(),
+                    systemPrompt,
+                    userPrompt);
+        } catch (Exception ex) {
+            // Delivery via SSE so the frontend sees an in-chat error instead of a 500 toast.
+            String safeMsg = "Sorry, I ran into an issue: "
+                    + (ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage());
             return chatStreamHandler.sendFixedReply(
-                    session.getId(), savedUserResponse, List.of(), OUT_OF_DOMAIN_REPLY);
+                    session.getId(), savedUserResponse, List.of(), safeMsg);
         }
-
-        // 6. Build LLM prompts from retrieved context + question
-        String systemPrompt = chatPromptBuilder.systemPrompt(repo.getFullName());
-        String userPrompt = chatPromptBuilder.userPrompt(retrievedContext.contextText(), userContent);
-
-        // 7. Stream LLM response to the client (SSE)
-        return chatStreamHandler.stream(
-                session.getId(),
-                savedUserResponse,
-                retrievedContext.citations(),
-                systemPrompt,
-                userPrompt);
     }
 
     /**
