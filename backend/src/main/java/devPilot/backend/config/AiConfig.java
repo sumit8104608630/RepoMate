@@ -126,7 +126,7 @@ public class AiConfig {
             RestClient openRouterRestClient,
             @Value("${spring.ai.openai.chat.options.model:openai/gpt-4o-mini}") String model,
             @Value("${spring.ai.openai.chat.options.temperature:0.2}") double temperature,
-            @Value("${spring.ai.openai.chat.options.max-tokens:4096}") int maxTokens) {
+            @Value("${app.ai.max-tokens:1024}") int maxTokens) {
         log.info("Registering @Primary OpenRouterChatModel: model={}, temperature={}, maxTokens={}", model, temperature, maxTokens);
         return new OpenRouterChatModel(openRouterRestClient, model, temperature, maxTokens);
     }
