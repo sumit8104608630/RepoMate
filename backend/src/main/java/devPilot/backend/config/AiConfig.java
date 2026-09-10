@@ -126,7 +126,7 @@ public class AiConfig {
             RestClient openRouterRestClient,
             @Value("${spring.ai.openai.chat.options.model:openai/gpt-4o-mini}") String model,
             @Value("${spring.ai.openai.chat.options.temperature:0.2}") double temperature,
-            @Value("${app.ai.max-tokens:1024}") int maxTokens) {
+            @Value("${app.ai.max-tokens:512}") int maxTokens) {
         log.info("Registering @Primary OpenRouterChatModel: model={}, temperature={}, maxTokens={}", model, temperature, maxTokens);
         return new OpenRouterChatModel(openRouterRestClient, model, temperature, maxTokens);
     }
@@ -299,37 +299,83 @@ public class AiConfig {
             body.put("temperature", BigDecimal.valueOf(temperature));
             body.put("stream", false);
             ChatOptions options = prompt.getOptions();
-            int capped = maxTokens;
+            int initialCap = maxTokens;
             if (options != null && options.getMaxTokens() != null) {
-                capped = Math.min(options.getMaxTokens(), maxTokens);
+                initialCap = Math.min(options.getMaxTokens(), initialCap);
             }
-            body.put("max_tokens", capped);
             if (options != null && options.getStopSequences() != null && !options.getStopSequences().isEmpty()) {
                 List<String> stops = options.getStopSequences();
                 body.put("stop", stops.size() == 1 ? stops.get(0) : stops);
             }
 
-            Map<String, Object> payload;
-            try {
-                payload = client.post()
-                        .uri("/chat/completions")
-                        .body(body)
-                        .retrieve()
-                        .body(new ParameterizedTypeReference<Map<String, Object>>() {});
-            } catch (HttpClientErrorException ex) {
-                throw translateOpenRouter(ex, "POST /chat/completions (model=" + model + ")");
+            // OpenRouter checks worst-case cost (max_tokens * rate) against credits.
+            // If the user's balance is very low, a 402 will be returned even if the actual
+            // generated tokens would fit. Retry with progressively smaller caps so chats
+            // still produce answers for users with very low remaining credits.
+            int[] retryCaps = { initialCap, Math.min(initialCap, 256), Math.min(initialCap, 128), 64 };
+            HttpClientErrorException lastHttpErr = null;
+            RuntimeException lastRuntimeErr = null;
+
+            for (int attempt = 0; attempt < retryCaps.length; attempt++) {
+                int cap = retryCaps[attempt];
+                if (cap <= 0) continue;
+                body.put("max_tokens", cap);
+                try {
+                    log.info("OpenRouterChatModel.call: attempt={}/{} max_tokens={}, model={}",
+                            attempt + 1, retryCaps.length, cap, model);
+                    Map<String, Object> payload = client.post()
+                            .uri("/chat/completions")
+                            .body(body)
+                            .retrieve()
+                            .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+                    List<Object> choices = (List<Object>) payload.getOrDefault("choices", List.of());
+                    List<Generation> generations = new ArrayList<>(choices.size());
+                    for (Object item : choices) {
+                        Map<String, Object> first = (Map<String, Object>) item;
+                        Map<String, Object> msg = (Map<String, Object>) first.get("message");
+                        String text = msg == null ? "" : String.valueOf(msg.getOrDefault("content", ""));
+                        AssistantMessage assistant = new AssistantMessage(text);
+                        generations.add(new Generation(assistant));
+                    }
+                    return new ChatResponse(generations);
+                } catch (HttpClientErrorException ex) {
+                    lastHttpErr = ex;
+                    HttpStatus status = HttpStatus.resolve(ex.getStatusCode().value());
+                    if (status == HttpStatus.PAYMENT_REQUIRED) {
+                        String bodyStr = ex.getResponseBodyAsString();
+                        log.warn("OpenRouterChatModel.call: got 402 Payment Required on attempt={}/{} cap={}. "
+                                + "Will retry with lower cap if available. Body preview: {}",
+                                attempt + 1, retryCaps.length, cap,
+                                bodyStr.length() > 200 ? bodyStr.substring(0, 200) : bodyStr);
+                        // Try next smaller cap (if any left)
+                        continue;
+                    }
+                    throw translateOpenRouter(ex, "POST /chat/completions (model=" + model + ")");
+                } catch (RuntimeException ex) {
+                    lastRuntimeErr = ex;
+                    throw ex;
+                }
             }
 
-            List<Object> choices = (List<Object>) payload.getOrDefault("choices", List.of());
-            List<Generation> generations = new ArrayList<>(choices.size());
-            for (Object item : choices) {
-                Map<String, Object> first = (Map<String, Object>) item;
-                Map<String, Object> msg = (Map<String, Object>) first.get("message");
-                String text = msg == null ? "" : String.valueOf(msg.getOrDefault("content", ""));
-                AssistantMessage assistant = new AssistantMessage(text);
-                generations.add(new Generation(assistant));
+            // All retry caps failed — throw the last 402 with a clear message.
+            if (lastHttpErr != null) {
+                StringBuilder hint = new StringBuilder("OpenRouter returned 402 Payment Required for ALL retry caps (");
+                for (int c : retryCaps) hint.append(c).append(" ");
+                hint.append("tokens). The user's credit balance is extremely low.\n")
+                    .append("  Fix options (user action):\n")
+                    .append("    1. Add credits at https://openrouter.ai/settings/credits\n")
+                    .append("    2. Or lower app.ai.max-tokens further in application-render.properties\n")
+                    .append("  Raw last response: ")
+                    .append(lastHttpErr.getResponseBodyAsString().length() > 500
+                            ? lastHttpErr.getResponseBodyAsString().substring(0, 500)
+                            : lastHttpErr.getResponseBodyAsString());
+                RuntimeException err = new RuntimeException(hint.toString(), lastHttpErr);
+                log.error("OpenRouterChatModel.call: all 402 retries exhausted.", err);
+                throw err;
             }
-            return new ChatResponse(generations);
+            if (lastRuntimeErr != null) throw lastRuntimeErr;
+            throw new RuntimeException("OpenRouterChatModel.call: no response and no captured error");
         }
 
         @Override
