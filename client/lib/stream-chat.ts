@@ -45,6 +45,7 @@ export async function streamChatMessage(
   let buffer = "";
   let receivedDone = false;
   let aborted = false;
+  let streamError: Error | null = null;
 
   if (handlers.signal) {
     handlers.signal.addEventListener("abort", () => {
@@ -96,22 +97,36 @@ export async function streamChatMessage(
           } catch {
             // ignore
           }
-          handlers.onError?.(new Error(msg));
-          return;
+          const err = new Error(msg);
+          streamError = err;
+          handlers.onError?.(err);
+          break;
         }
       } catch (err) {
-        handlers.onError?.(
-          err instanceof Error ? err : new Error("Failed to parse SSE event")
-        );
+        const wrapped =
+          err instanceof Error ? err : new Error("Failed to parse SSE event");
+        streamError = wrapped;
+        handlers.onError?.(wrapped);
+        break;
       }
     }
+
+    if (streamError) break;
   }
 
   if (aborted) return;
-  if (!receivedDone) {
-    handlers.onError?.(
-      new Error("Stream closed unexpectedly. Please check your API key quota or network.")
+
+  if (!receivedDone && !streamError) {
+    const err = new Error(
+      "Stream closed unexpectedly. Please check your API key quota or network."
     );
+    streamError = err;
+    handlers.onError?.(err);
   }
+
   handlers.onDone?.();
+
+  if (streamError) {
+    throw streamError;
+  }
 }

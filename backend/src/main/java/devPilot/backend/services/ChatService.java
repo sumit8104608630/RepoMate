@@ -1,6 +1,8 @@
 package devPilot.backend.services;
 
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 
 import org.springframework.stereotype.Service;
@@ -23,6 +25,7 @@ import devPilot.backend.services.ai.ChatPromptBuilder;
 import devPilot.backend.services.ai.ChatStreamHandler;
 import devPilot.backend.services.ai.CitationMapper;
 import devPilot.backend.services.ai.CodeContextRetriever;
+import devPilot.backend.services.ai.RetrievedContext;
 import lombok.RequiredArgsConstructor;
 
 /**
@@ -31,10 +34,25 @@ import lombok.RequiredArgsConstructor;
  * <p>{@link #streamReply} orchestrates the full flow:
  * validate → save user message → retrieve code context → build prompts → stream AI reply.
  * Each step is implemented in a dedicated class under {@code service.ai}.
+ *
+ * <p>Short-circuit paths:
+ * <ul>
+ *   <li>{@link #isGreeting(String)} — pure greetings get a canned reply, no LLM call.</li>
+ *   <li>{@link RetrievedContext#contextText()} empty / NO_MATCHES → canned out-of-domain reply,
+ *       no LLM call.</li>
+ * </ul>
  */
 @Service
 @RequiredArgsConstructor
 public class ChatService {
+
+    static final String GREETING_REPLY = "hii iam repomate how ca i help you";
+    static final String OUT_OF_DOMAIN_REPLY = "it is out of domain";
+    private static final String NO_MATCHES = "(no matching code chunks found)";
+
+    private static final Set<String> GREETING_TOKENS = Set.of(
+            "hi", "hii", "hiii", "hello", "hallo", "helo", "hey", "heyy",
+            "yo", "sup", "wassup", "whatsapp", "howdy", "hola", "namaste");
 
     private final ChatSessionRepository chatSessionRepository;
     private final ChatMessageRepository chatMessageRepository;
@@ -102,21 +120,62 @@ public class ChatService {
                 .role(MessageRole.USER)
                 .content(userContent)
                 .build());
+        ChatMessageResponse savedUserResponse = toMessageResponse(userMessage);
 
-        // 3. RAG retrieval — find code chunks similar to the question
+        // 3. Greeting short-circuit — no LLM call, no RAG lookup
+        if (isGreeting(userContent)) {
+            return chatStreamHandler.sendFixedReply(
+                    session.getId(), savedUserResponse, List.of(), GREETING_REPLY);
+        }
+
+        // 4. RAG retrieval — find code chunks similar to the question
         var retrievedContext = codeContextRetriever.retrieve(repo.getId(), userContent);
 
-        // 4. Build LLM prompts from retrieved context + question
+        // 5. Out-of-domain short-circuit — no matching code → canned answer, no LLM call
+        if (retrievedContext.contextText() == null
+                || retrievedContext.contextText().isBlank()
+                || NO_MATCHES.equals(retrievedContext.contextText())) {
+            return chatStreamHandler.sendFixedReply(
+                    session.getId(), savedUserResponse, List.of(), OUT_OF_DOMAIN_REPLY);
+        }
+
+        // 6. Build LLM prompts from retrieved context + question
         String systemPrompt = chatPromptBuilder.systemPrompt(repo.getFullName());
         String userPrompt = chatPromptBuilder.userPrompt(retrievedContext.contextText(), userContent);
 
-        // 5. Stream OpenAI response to the client (SSE)
+        // 7. Stream LLM response to the client (SSE)
         return chatStreamHandler.stream(
                 session.getId(),
-                toMessageResponse(userMessage),
+                savedUserResponse,
                 retrievedContext.citations(),
                 systemPrompt,
                 userPrompt);
+    }
+
+    /**
+     * Determines whether the user's message is a pure greeting that should get the
+     * canned repomate greeting reply without an LLM call.
+     *
+     * <p>Normalizes input by lowercasing and stripping punctuation, then tokenizes
+     * by whitespace. Accepts the message if EVERY non-empty token is a known
+     * greeting. This matches "hii", "hi!!", "hello there", "hii how are you" would
+     * NOT match (presence of words like "how"/"are"/"you" disqualify it — those are
+     * real questions the LLM should answer if context allows).
+     */
+    static boolean isGreeting(String raw) {
+        if (raw == null) return false;
+        String normalized = raw.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9\\s]", "")
+                .trim();
+        if (normalized.isEmpty()) return false;
+        String[] tokens = normalized.split("\\s+");
+        int matched = 0;
+        for (String t : tokens) {
+            if (t.isEmpty()) continue;
+            if (GREETING_TOKENS.contains(t)) matched++;
+            else return false;
+        }
+        return matched > 0;
     }
 
     private ChatSessionResponse toSessionResponse(ChatSession session) {
