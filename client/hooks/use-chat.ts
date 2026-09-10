@@ -54,6 +54,25 @@ export function useStreamChat(sessionId: string | null) {
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
   const abortRef = useRef<AbortController | null>(null);
+  const didFinalRefetchRef = useRef(false);
+
+  const ensureMessagesRefetched = useCallback(async () => {
+    if (!sessionId) return;
+    const key = queryKeys.chat.messages(sessionId);
+    try {
+      await queryClient.invalidateQueries({
+        queryKey: key,
+        refetchType: "active",
+      });
+      await queryClient.refetchQueries({
+        queryKey: key,
+        type: "active",
+        exact: true,
+      });
+    } catch {
+      // ignore — cache still contains the optimistic / setQueryData copy
+    }
+  }, [sessionId, queryClient]);
 
   const send = useCallback(
     async (content: string) => {
@@ -62,6 +81,7 @@ export function useStreamChat(sessionId: string | null) {
       abortRef.current?.abort();
       const controller = new AbortController();
       abortRef.current = controller;
+      didFinalRefetchRef.current = false;
 
       const optimisticId = `temp-${Date.now()}`;
       const optimistic: ChatMessage = {
@@ -98,13 +118,38 @@ export function useStreamChat(sessionId: string | null) {
           onAssistantMessage: (message) => {
             queryClient.setQueryData<ChatMessage[]>(
               queryKeys.chat.messages(sessionId),
-              (prev) => [...(prev ?? []), message]
+              (prev) => {
+                const base = (prev ?? []).filter((m) => m.id !== optimisticId);
+                if (base.some((m) => m.id === message.id)) return base;
+                return [...base, message];
+              }
             );
             setStreamText("");
+            didFinalRefetchRef.current = true;
+            void ensureMessagesRefetched();
+          },
+          onDone: () => {
+            if (!didFinalRefetchRef.current) {
+              didFinalRefetchRef.current = true;
+              void ensureMessagesRefetched();
+            }
+          },
+          onError: () => {
+            if (!didFinalRefetchRef.current) {
+              didFinalRefetchRef.current = true;
+              void ensureMessagesRefetched();
+            }
           },
         });
       } catch (err) {
-        if ((err as Error).name === "AbortError") return;
+        if ((err as Error).name === "AbortError") {
+          // ensure we still see any partially-saved messages after user stopped
+          if (!didFinalRefetchRef.current) {
+            didFinalRefetchRef.current = true;
+            void ensureMessagesRefetched();
+          }
+          return;
+        }
         toast.add({
           title: "Message failed",
           description: err instanceof Error ? err.message : "Unknown error",
@@ -115,11 +160,15 @@ export function useStreamChat(sessionId: string | null) {
           (prev) => (prev ?? []).filter((m) => m.id !== optimisticId)
         );
         setStreamText("");
+        if (!didFinalRefetchRef.current) {
+          didFinalRefetchRef.current = true;
+          void ensureMessagesRefetched();
+        }
       } finally {
         setStreaming(false);
       }
     },
-    [sessionId, streaming, queryClient]
+    [sessionId, streaming, queryClient, ensureMessagesRefetched]
   );
 
   const stop = useCallback(() => {
