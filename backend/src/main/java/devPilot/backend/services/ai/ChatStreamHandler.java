@@ -8,6 +8,7 @@ import java.util.concurrent.RejectedExecutionException;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -18,6 +19,7 @@ import devPilot.backend.entity.ChatMessage;
 import devPilot.backend.entity.MessageRole;
 import devPilot.backend.repository.ChatMessageRepository;
 import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
 
 /**
  * Generation step: call OpenAI via Spring AI and stream tokens to the browser over SSE.
@@ -70,27 +72,83 @@ public class ChatStreamHandler {
                         .name("user_message")
                         .data(savedUserMessage));
 
-                ChatClient.builder(chatModel)
+                Flux<String> contentFlux = ChatClient.builder(chatModel)
                         .build()
                         .prompt()
                         .system(systemPrompt)
                         .user(userPrompt)
                         .stream()
-                        .content()
-                        .doOnNext(token -> appendToken(emitter, fullReply, token))
+                        .content();
+
+                StringBuilder collected = new StringBuilder();
+
+                contentFlux
+                        .doOnNext(token -> {
+                            if (token != null && !token.isEmpty()) {
+                                collected.append(token);
+                            }
+                        })
                         .doOnError(err -> {
                             log.error("Chat stream error", err);
                             sendErrorThenComplete(emitter, err);
                         })
-                        .doOnComplete(() -> completeStream(
-                                emitter, sessionId, fullReply, citations))
-                        .subscribe();
+                        .doOnComplete(() -> {
+                            String raw = collected.toString();
+                            if (raw.isEmpty() && fullReply.length() > 0) {
+                                raw = fullReply.toString();
+                            }
+                            if (!raw.isEmpty()) {
+                                emitCharactersGradually(emitter, fullReply, raw);
+                            }
+                            completeStream(emitter, sessionId, fullReply, citations);
+                        })
+                        .subscribe(token -> {
+                            if (token != null && !token.isEmpty()) {
+                                boolean isBatchedSingleChunk = collected.length() == token.length() || collected.length() == 0;
+                                if (!isBatchedSingleChunk) {
+                                    appendToken(emitter, fullReply, token);
+                                }
+                            }
+                        });
             } catch (Exception ex) {
                 sendErrorThenComplete(emitter, ex);
             }
         };
         submitOrRunDirect(work, "stream(LLM)");
         return emitter;
+    }
+
+    /**
+     * Emits characters one by one with a tiny per-char sleep, giving the UI a realistic
+     * "typing" animation. This is used when the underlying model does not support true
+     * token streaming (e.g. OpenRouter via our RestClient wrapper), so instead of dumping
+     * the entire reply in a single "token" event and jarring the user, we reveal it
+     * gradually.
+     */
+    private void emitCharactersGradually(
+            SseEmitter emitter, StringBuilder fullReply, String text) {
+        if (text == null || text.isEmpty()) return;
+        long perCharNanos = text.length() <= 100 ? 12_000_000L
+                : text.length() <= 500 ? 8_000_000L
+                : 5_000_000L;
+        for (int i = 0; i < text.length(); i++) {
+            appendToken(emitter, fullReply, String.valueOf(text.charAt(i)));
+            if (perCharNanos > 0) {
+                try {
+                    long millis = perCharNanos / 1_000_000L;
+                    int nanos = (int) (perCharNanos % 1_000_000L);
+                    if (millis > 0 || nanos > 0) {
+                        Thread.sleep(millis, nanos);
+                    }
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                    for (int j = i + 1; j < text.length(); j++) {
+                        appendToken(emitter, fullReply, String.valueOf(text.charAt(j)));
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     /** Stream a canned / deterministic reply (greeting, out-of-domain) with no LLM call. */

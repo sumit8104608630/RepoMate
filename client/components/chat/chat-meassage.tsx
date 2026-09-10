@@ -24,17 +24,19 @@ export function ChatMessages({
   messages,
   streamText,
   isLoading,
+  isStreaming,
 }: {
   repo: Repository;
   messages: ChatMessage[];
   streamText?: string;
   isLoading?: boolean;
+  isStreaming?: boolean;
 }) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, streamText]);
+  }, [messages, streamText, isStreaming]);
 
   if (isLoading) {
     return (
@@ -45,6 +47,8 @@ export function ChatMessages({
       </div>
     );
   }
+
+  const showThinkingIndicator = isStreaming && !streamText;
 
   return (
     <ScrollArea className="flex-1">
@@ -106,6 +110,32 @@ export function ChatMessages({
               </Message>
             );
           })}
+
+          {showThinkingIndicator && (
+            <Message align="start">
+              <MessageAvatar>
+                <Avatar className="size-8">
+                  <AvatarFallback className="bg-muted">
+                    <Bot className="size-4" />
+                  </AvatarFallback>
+                </Avatar>
+              </MessageAvatar>
+              <MessageContent>
+                <Bubble variant="muted" align="start">
+                  <BubbleContent className="px-4 py-3">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <span className="inline-flex gap-1">
+                        <span className="h-2 w-2 animate-bounce rounded-full bg-foreground/40 [animation-delay:-0.3s]" />
+                        <span className="h-2 w-2 animate-bounce rounded-full bg-foreground/40 [animation-delay:-0.15s]" />
+                        <span className="h-2 w-2 animate-bounce rounded-full bg-foreground/40" />
+                      </span>
+                      <span>Thinking…</span>
+                    </div>
+                  </BubbleContent>
+                </Bubble>
+              </MessageContent>
+            </Message>
+          )}
 
           {streamText && (
             <Message align="start">
