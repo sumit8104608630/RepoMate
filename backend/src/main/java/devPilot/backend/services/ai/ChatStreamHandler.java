@@ -150,35 +150,64 @@ public class ChatStreamHandler {
     }
 
     /**
-     * Emits characters one by one with a tiny per-char sleep, giving the UI a realistic
-     * "typing" animation. This is used when the underlying model does not support true
-     * token streaming (e.g. OpenRouter via our RestClient wrapper), so instead of dumping
-     * the entire reply in a single "token" event and jarring the user, we reveal it
-     * gradually.
+     * Emits tokens in batches with a fixed total animation budget.
+     *
+     * <p>Since our model does not support true token streaming (we receive the FULL answer
+     * in one HTTP call), artificially sleeping one char at a time creates massive delays:
+     * 2000 chars * 5ms = 10s of pure Thread.sleep() with zero network activity. The user
+     * sees tokens arriving in DevTools but the UI bubble lags because we drip-feed them.</p>
+     *
+     * <p>This method instead:
+     * <ul>
+     *   <li>Divides the reply into a fixed number of chunks (MAX_FRAMES = ~20)</li>
+     *   <li>Sends one chunk per frame at ~30fps (33ms per frame)</li>
+     *   <li>Total animation is ALWAYS ~700ms max, regardless of reply length</li>
+     *   <li>Short replies (< 80 chars) emit instantly for responsiveness</li>
+     * </ul>
+     * The UI still shows a smooth "growing text" effect but without frustrating waits.</p>
      */
     private void emitCharactersGradually(
             SseEmitter emitter, StringBuilder fullReply, String text) {
         if (text == null || text.isEmpty()) return;
-        long perCharNanos = text.length() <= 100 ? 12_000_000L
-                : text.length() <= 500 ? 8_000_000L
-                : 5_000_000L;
-        for (int i = 0; i < text.length(); i++) {
-            appendToken(emitter, fullReply, String.valueOf(text.charAt(i)));
-            if (perCharNanos > 0) {
-                try {
-                    long millis = perCharNanos / 1_000_000L;
-                    int nanos = (int) (perCharNanos % 1_000_000L);
-                    if (millis > 0 || nanos > 0) {
-                        Thread.sleep(millis, nanos);
-                    }
-                } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
-                    for (int j = i + 1; j < text.length(); j++) {
-                        appendToken(emitter, fullReply, String.valueOf(text.charAt(j)));
-                    }
-                    break;
-                }
+
+        // Short replies (greetings, out-of-domain, errors): emit instantly
+        if (text.length() <= 80) {
+            appendToken(emitter, fullReply, text);
+            return;
+        }
+
+        // Target ~30fps with ~20 frames → ~660ms total animation, independent of length
+        final int maxFrames = 20;
+        final long perFrameMillis = 33L;
+        final int totalChars = text.length();
+        final int frames = Math.min(maxFrames, totalChars);
+        final int charsPerFrame = Math.max(1, totalChars / frames);
+
+        int emitted = 0;
+        boolean interrupted = false;
+        for (int f = 0; f < frames; f++) {
+            if (interrupted) break;
+            int take;
+            if (f == frames - 1) {
+                take = totalChars - emitted; // last frame: any remainder
+            } else {
+                take = charsPerFrame;
             }
+            if (take <= 0) break;
+            int end = Math.min(emitted + take, totalChars);
+            String chunk = text.substring(emitted, end);
+            emitted = end;
+            appendToken(emitter, fullReply, chunk);
+            try {
+                Thread.sleep(perFrameMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                interrupted = true;
+            }
+        }
+        // Send any remaining characters (interrupt / rounding)
+        if (emitted < totalChars) {
+            appendToken(emitter, fullReply, text.substring(emitted));
         }
     }
 
@@ -202,11 +231,8 @@ public class ChatStreamHandler {
             try {
                 log.info("ChatStreamHandler.sendFixedReply: session={}, replyLen={}", sessionId, reply.length());
                 emitter.send(SseEmitter.event().name("user_message").data(savedUserMessage));
-                // Character-by-character token emission so the UI animates identically to
-                // real LLM streams. Clients expect incremental "token" events.
-                for (int i = 0; i < reply.length(); i++) {
-                    appendToken(emitter, fullReply, String.valueOf(reply.charAt(i)));
-                }
+                // Use the same smooth/fast batched emission as real LLM replies.
+                emitCharactersGradually(emitter, fullReply, reply);
                 completeStream(emitter, sessionId, fullReply, citations);
             } catch (Exception ex) {
                 log.error("ChatStreamHandler.sendFixedReply: error during work, session={}", sessionId, ex);
