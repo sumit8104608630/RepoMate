@@ -6,9 +6,12 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -19,7 +22,6 @@ import devPilot.backend.entity.ChatMessage;
 import devPilot.backend.entity.MessageRole;
 import devPilot.backend.repository.ChatMessageRepository;
 import lombok.extern.slf4j.Slf4j;
-import reactor.core.publisher.Flux;
 
 /**
  * Generation step: call OpenAI via Spring AI and stream tokens to the browser over SSE.
@@ -64,53 +66,31 @@ public class ChatStreamHandler {
             String userPrompt) {
 
         SseEmitter emitter = new SseEmitter(RagSettings.STREAM_TIMEOUT_MS);
-        StringBuilder fullReply = new StringBuilder();
 
         Runnable work = () -> {
+            StringBuilder fullReply = new StringBuilder();
             try {
                 emitter.send(SseEmitter.event()
                         .name("user_message")
                         .data(savedUserMessage));
 
-                Flux<String> contentFlux = ChatClient.builder(chatModel)
-                        .build()
-                        .prompt()
-                        .system(systemPrompt)
-                        .user(userPrompt)
-                        .stream()
-                        .content();
+                List<Message> messages = List.of(
+                        new SystemMessage(systemPrompt),
+                        new UserMessage(userPrompt));
+                Prompt prompt = new Prompt(messages);
+                ChatResponse response = chatModel.call(prompt);
+                String raw = response.getResults().isEmpty()
+                        ? ""
+                        : response.getResults().get(0).getOutput().getText();
 
-                StringBuilder collected = new StringBuilder();
+                if (raw == null || raw.isBlank()) {
+                    raw = "(no response from the model)";
+                }
 
-                contentFlux
-                        .doOnNext(token -> {
-                            if (token != null && !token.isEmpty()) {
-                                collected.append(token);
-                            }
-                        })
-                        .doOnError(err -> {
-                            log.error("Chat stream error", err);
-                            sendErrorThenComplete(emitter, err);
-                        })
-                        .doOnComplete(() -> {
-                            String raw = collected.toString();
-                            if (raw.isEmpty() && fullReply.length() > 0) {
-                                raw = fullReply.toString();
-                            }
-                            if (!raw.isEmpty()) {
-                                emitCharactersGradually(emitter, fullReply, raw);
-                            }
-                            completeStream(emitter, sessionId, fullReply, citations);
-                        })
-                        .subscribe(token -> {
-                            if (token != null && !token.isEmpty()) {
-                                boolean isBatchedSingleChunk = collected.length() == token.length() || collected.length() == 0;
-                                if (!isBatchedSingleChunk) {
-                                    appendToken(emitter, fullReply, token);
-                                }
-                            }
-                        });
+                emitCharactersGradually(emitter, fullReply, raw);
+                completeStream(emitter, sessionId, fullReply, citations);
             } catch (Exception ex) {
+                log.error("Chat stream error", ex);
                 sendErrorThenComplete(emitter, ex);
             }
         };
