@@ -308,13 +308,15 @@ public class AiConfig {
                 body.put("stop", stops.size() == 1 ? stops.get(0) : stops);
             }
 
-            // OpenRouter checks worst-case cost (max_tokens * rate) against credits.
-            // If the user's balance is very low, a 402 will be returned even if the actual
-            // generated tokens would fit. Retry with progressively smaller caps so chats
-            // still produce answers for users with very low remaining credits.
+            // OpenRouter has two distinct 402 sub-types:
+            //   (A) "more credits, or fewer max_tokens" → OUTPUT token budget issue → we CAN retry with smaller caps
+            //   (B) "Prompt tokens limit exceeded: X > Y"    → INPUT token budget issue  → smaller caps DO NOT HELP
+            // For type B, we skip all retries and throw a distinguishable exception so the caller
+            // can retry the WHOLE call with a shorter prompt (fewer RAG chunks) instead.
             int[] retryCaps = { initialCap, Math.min(initialCap, 256), Math.min(initialCap, 128), 64 };
             HttpClientErrorException lastHttpErr = null;
             RuntimeException lastRuntimeErr = null;
+            boolean last402WasPromptInput = false;
 
             for (int attempt = 0; attempt < retryCaps.length; attempt++) {
                 int cap = retryCaps[attempt];
@@ -344,11 +346,22 @@ public class AiConfig {
                     HttpStatus status = HttpStatus.resolve(ex.getStatusCode().value());
                     if (status == HttpStatus.PAYMENT_REQUIRED) {
                         String bodyStr = ex.getResponseBodyAsString();
-                        log.warn("OpenRouterChatModel.call: got 402 Payment Required on attempt={}/{} cap={}. "
+                        boolean isPromptInputLimit = bodyStr.contains("Prompt tokens limit exceeded");
+                        last402WasPromptInput = isPromptInputLimit;
+                        if (isPromptInputLimit) {
+                            // Input (prompt) tokens too large — retrying with smaller OUTPUT caps is useless.
+                            // Break immediately; caller handles this via PromptTokenLimitException.
+                            log.warn("OpenRouterChatModel.call: got 402 PAYMENT_REQUIRED (INPUT/prompt tokens) on attempt={}/{} cap={}. "
+                                    + "Skipping output-cap retries — caller must shrink prompt. Body preview: {}",
+                                    attempt + 1, retryCaps.length, cap,
+                                    bodyStr.length() > 200 ? bodyStr.substring(0, 200) : bodyStr);
+                            break;
+                        }
+                        // Output cap 402 — retry with smaller output cap (normal path).
+                        log.warn("OpenRouterChatModel.call: got 402 Payment Required (OUTPUT/max_tokens) on attempt={}/{} cap={}. "
                                 + "Will retry with lower cap if available. Body preview: {}",
                                 attempt + 1, retryCaps.length, cap,
                                 bodyStr.length() > 200 ? bodyStr.substring(0, 200) : bodyStr);
-                        // Try next smaller cap (if any left)
                         continue;
                     }
                     throw translateOpenRouter(ex, "POST /chat/completions (model=" + model + ")");
@@ -360,18 +373,29 @@ public class AiConfig {
 
             // All retry caps failed — throw the last 402 with a clear message.
             if (lastHttpErr != null) {
-                StringBuilder hint = new StringBuilder("OpenRouter returned 402 Payment Required for ALL retry caps (");
-                for (int c : retryCaps) hint.append(c).append(" ");
-                hint.append("tokens). The user's credit balance is extremely low.\n")
-                    .append("  Fix options (user action):\n")
-                    .append("    1. Add credits at https://openrouter.ai/settings/credits\n")
-                    .append("    2. Or lower app.ai.max-tokens further in application-render.properties\n")
-                    .append("  Raw last response: ")
+                StringBuilder hint = new StringBuilder();
+                if (last402WasPromptInput) {
+                    hint.append("OpenRouter returned 402 PAYMENT_REQUIRED because INPUT (prompt) tokens exceed your credit balance. ")
+                        .append("System prompt + RAG context + your question were too large.\n")
+                        .append("  Fix options (user action):\n")
+                        .append("    1. Add credits at https://openrouter.ai/settings/credits\n")
+                        .append("    2. Or ask a shorter question with less surrounding context\n");
+                } else {
+                    hint.append("OpenRouter returned 402 Payment Required for ALL retry caps (");
+                    for (int c : retryCaps) hint.append(c).append(" ");
+                    hint.append("tokens). The user's credit balance is extremely low.\n")
+                        .append("  Fix options (user action):\n")
+                        .append("    1. Add credits at https://openrouter.ai/settings/credits\n")
+                        .append("    2. Or lower app.ai.max-tokens further in application-render.properties\n");
+                }
+                hint.append("  Raw last response: ")
                     .append(lastHttpErr.getResponseBodyAsString().length() > 500
                             ? lastHttpErr.getResponseBodyAsString().substring(0, 500)
                             : lastHttpErr.getResponseBodyAsString());
-                RuntimeException err = new RuntimeException(hint.toString(), lastHttpErr);
-                log.error("OpenRouterChatModel.call: all 402 retries exhausted.", err);
+                RuntimeException err = last402WasPromptInput
+                        ? new PromptTokenLimitException(hint.toString(), lastHttpErr)
+                        : new RuntimeException(hint.toString(), lastHttpErr);
+                log.error("OpenRouterChatModel.call: all 402 retries exhausted (promptInputLimit={}).", last402WasPromptInput, err);
                 throw err;
             }
             if (lastRuntimeErr != null) throw lastRuntimeErr;

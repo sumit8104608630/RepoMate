@@ -57,6 +57,175 @@ public class ChatStreamHandler {
         this.streamExecutor = streamExecutor;
     }
 
+    /**
+     * Stream a real LLM reply WITH progressive prompt shrinking for credit-limited users.
+     *
+     * <p>This is the PREFERRED entry point from {@link devPilot.backend.services.ChatService}.
+     * It performs RAG retrieval + prompt building + LLM call all inside the same async work
+     * task, so any {@link devPilot.backend.config.PromptTokenLimitException} raised by the
+     * model can be caught IN SCOPE and immediately retried with a smaller prompt budget.
+     * Trying the budget loop outside the async task (in ChatService) would miss the exception
+     * because the model call happens inside a pool thread.</p>
+     *
+     * <p>Budget ladder (progressively smaller INPUT tokens):
+     * 1. Full prompt:  TOP_K_CHUNKS chunks × MAX_CHARS_PER_CHUNK per chunk
+     * 2. 3 chunks × 1000 chars
+     * 3. 2 chunks × 600 chars
+     * 4. 2 chunks × 300 chars
+     * 5. 1 chunk  × 250 chars
+     * 6. 1 chunk  × 120 chars   (tiny, just ~30 lines of code)
+     * 7. 0 chunks × 0 chars      (zero-RAG fallback: pure LLM knowledge answer)
+     *
+     * <p>For level-7 we send a disclaimer prepended to the system prompt so the LLM knows
+     * it's answering without repository context. If ALL 7 levels fail, we send a friendly
+     * in-chat error directing the user to add credits.</p>
+     */
+    public SseEmitter streamWithBudgetRetry(
+            UUID sessionId,
+            ChatMessageResponse savedUserMessage,
+            CodeContextRetriever codeContextRetriever,
+            ChatPromptBuilder chatPromptBuilder,
+            UUID repositoryId,
+            String repoFullName,
+            String userContent) {
+
+        SseEmitter emitter = new SseEmitter(RagSettings.STREAM_TIMEOUT_MS);
+        emitter.onTimeout(() -> {
+            log.warn("ChatStreamHandler.streamWithBudgetRetry: SSE emitter timeout session={}", sessionId);
+            sendErrorThenComplete(emitter, new RuntimeException("Response timed out"));
+        });
+        emitter.onError(t -> log.warn("ChatStreamHandler.streamWithBudgetRetry: emitter error session={}: {}", sessionId, t.toString()));
+        emitter.onCompletion(() -> log.debug("ChatStreamHandler.streamWithBudgetRetry: emitter completed session={}", sessionId));
+
+        record PromptBudget(int topK, int maxCharsPerChunk) {}
+        List<PromptBudget> budgets = List.of(
+                new PromptBudget(RagSettings.TOP_K_CHUNKS, RagSettings.MAX_CHARS_PER_CHUNK),
+                new PromptBudget(3, 1000),
+                new PromptBudget(2, 600),
+                new PromptBudget(2, 300),
+                new PromptBudget(1, 250),
+                new PromptBudget(1, 120),
+                new PromptBudget(0, 0)
+        );
+
+        Runnable work = () -> {
+            StringBuilder fullReply = new StringBuilder();
+            try {
+                emitter.send(SseEmitter.event().name("user_message").data(savedUserMessage));
+
+                // Budget loop — try smaller and smaller INPUTs if we keep getting
+                // PromptTokenLimitException (402 INPUT tokens too many).
+                devPilot.backend.config.PromptTokenLimitException lastPromptEx = null;
+                List<CitationDto> finalCitations = List.of();
+                String rawFinal = "";
+
+                for (int bi = 0; bi < budgets.size(); bi++) {
+                    PromptBudget b = budgets.get(bi);
+                    String systemPrompt;
+                    String userPrompt;
+                    List<CitationDto> citations;
+                    RetrievedContext retrievedContext;
+
+                    if (b.topK() <= 0) {
+                        // Zero-RAG fallback: LLM knowledge only.
+                        retrievedContext = new RetrievedContext(List.of(), "");
+                        citations = List.of();
+                        systemPrompt = chatPromptBuilder.systemPrompt(repoFullName)
+                                + "\n\nIMPORTANT NOTE: NO repository code context is available for this question."
+                                + " If the user asks about specific code/structure, tell them you cannot see any files"
+                                + " right now due to a temporary credit-budget limitation.";
+                        userPrompt = chatPromptBuilder.userPrompt("", userContent);
+                    } else {
+                        retrievedContext = codeContextRetriever.retrieve(
+                                repositoryId, userContent, b.topK(), b.maxCharsPerChunk());
+                        citations = retrievedContext.citations();
+                        systemPrompt = chatPromptBuilder.systemPrompt(repoFullName);
+                        userPrompt = chatPromptBuilder.userPrompt(
+                                retrievedContext.contextText() == null ? "" : retrievedContext.contextText(),
+                                userContent);
+                    }
+                    finalCitations = citations;
+
+                    // Build Spring AI prompt with current budget.
+                    List<Message> messages = List.of(
+                            new SystemMessage(systemPrompt),
+                            new UserMessage(userPrompt));
+                    Prompt prompt = new Prompt(messages);
+
+                    try {
+                        log.info("ChatStreamHandler.streamWithBudgetRetry: budgetAttempt={}/{} topK={} charsPerChunk={} session={}",
+                                bi + 1, budgets.size(), b.topK(), b.maxCharsPerChunk(), sessionId);
+                        ChatResponse response = chatModel.call(prompt);
+
+                        String raw = "";
+                        if (response != null && response.getResults() != null && !response.getResults().isEmpty()) {
+                            var outputMessage = response.getResults().get(0).getOutput();
+                            raw = extractMessageText(outputMessage);
+                            log.info("ChatStreamHandler.streamWithBudgetRetry: SUCCESS at budgetAttempt={}/{} resultCount={} textLen={} session={}",
+                                    bi + 1, budgets.size(), response.getResults().size(),
+                                    raw == null ? 0 : raw.length(), sessionId);
+                        } else {
+                            log.warn("ChatStreamHandler.streamWithBudgetRetry: chatModel.call returned empty/null at budgetAttempt={}/{} session={}",
+                                    bi + 1, budgets.size(), sessionId);
+                        }
+                        if (raw == null || raw.isBlank()) {
+                            raw = "(no response from the model)";
+                        }
+                        rawFinal = raw;
+                        lastPromptEx = null;
+                        break; // SUCCESS — break out of budget loop
+                    } catch (RuntimeException rtEx) {
+                        // Drill to PromptTokenLimitException if it's the cause.
+                        Throwable cause = rtEx;
+                        devPilot.backend.config.PromptTokenLimitException pp = null;
+                        while (cause != null) {
+                            if (cause instanceof devPilot.backend.config.PromptTokenLimitException found) {
+                                pp = found;
+                                break;
+                            }
+                            cause = cause.getCause();
+                        }
+                        if (pp == null) {
+                            // Not a prompt-input 402 — propagate (non-retryable here).
+                            throw rtEx;
+                        }
+                        lastPromptEx = pp;
+                        log.warn("ChatStreamHandler.streamWithBudgetRetry: PromptTokenLimit at budgetAttempt={}/{} topK={} charsPerChunk={}. "
+                                + "Trying smaller prompt budget (if any left).",
+                                bi + 1, budgets.size(), b.topK(), b.maxCharsPerChunk());
+                        if (bi == budgets.size() - 1) {
+                            // Last budget failed → break and deliver user-facing error.
+                            break;
+                        }
+                    }
+                }
+
+                if (lastPromptEx != null) {
+                    // All budget levels 402'd on INPUT tokens. Deliver friendly chat reply.
+                    String raw = lastPromptEx.getMessage() == null ? "" : lastPromptEx.getMessage();
+                    int nl = raw.indexOf('\n');
+                    String firstLine = nl > 0 ? raw.substring(0, nl) : raw;
+                    String safeMsg = "Sorry — I couldn't fit this question into your OpenRouter credit budget "
+                            + "even with minimal context. The quickest fix is adding credits at "
+                            + "https://openrouter.ai/settings/credits. (Raw error: " + firstLine + ")";
+                    emitCharactersGradually(emitter, fullReply, safeMsg);
+                    completeStream(emitter, sessionId, fullReply, List.of());
+                    return;
+                }
+
+                emitCharactersGradually(emitter, fullReply, rawFinal);
+                log.info("ChatStreamHandler.streamWithBudgetRetry: finishing replyLen={} session={}",
+                        fullReply.length(), sessionId);
+                completeStream(emitter, sessionId, fullReply, finalCitations);
+            } catch (Exception ex) {
+                log.error("ChatStreamHandler.streamWithBudgetRetry: error during work, session={}", sessionId, ex);
+                sendErrorThenComplete(emitter, ex);
+            }
+        };
+        submitOrRunDirect(work, "streamWithBudgetRetry");
+        return emitter;
+    }
+
     /** Stream a real LLM reply. */
     public SseEmitter stream(
             UUID sessionId,

@@ -25,6 +25,7 @@ import devPilot.backend.services.ai.ChatPromptBuilder;
 import devPilot.backend.services.ai.ChatStreamHandler;
 import devPilot.backend.services.ai.CitationMapper;
 import devPilot.backend.services.ai.CodeContextRetriever;
+import devPilot.backend.services.ai.RagSettings;
 import devPilot.backend.services.ai.RetrievedContext;
 import lombok.RequiredArgsConstructor;
 
@@ -129,28 +130,35 @@ public class ChatService {
         }
 
         try {
-            // 4. RAG retrieval — find code chunks similar to the question
-            var retrievedContext = codeContextRetriever.retrieve(repo.getId(), userContent);
-
-            // 5. Out-of-domain short-circuit — no matching code → canned answer, no LLM call
-            if (retrievedContext.contextText() == null
-                    || retrievedContext.contextText().isBlank()
-                    || NO_MATCHES.equals(retrievedContext.contextText())) {
+            // 4. Do a quick retrieval on the caller (HTTP) thread to detect out-of-domain
+            //    BEFORE offloading to the stream executor. This avoids wasting a pool thread
+            //    on questions we'll answer with the canned "it is out of domain" reply.
+            //
+            //    We intentionally do NOT use this RetrievedContext directly for the LLM call,
+            //    because progressive prompt shrinking (per OpenRouter 402 "Prompt tokens
+            //    limit exceeded") must happen inside the same async task that calls the model.
+            //    ChatStreamHandler.streamWithBudgetRetry will re-retrieve with progressively
+            //    smaller budgets inside its async scope, guaranteeing PromptTokenLimitException
+            //    is caught where it's thrown.
+            var probeContext = codeContextRetriever.retrieve(repo.getId(), userContent,
+                    RagSettings.TOP_K_CHUNKS, RagSettings.MAX_CHARS_PER_CHUNK);
+            if (probeContext.contextText() == null
+                    || probeContext.contextText().isBlank()
+                    || NO_MATCHES.equals(probeContext.contextText())) {
                 return chatStreamHandler.sendFixedReply(
                         session.getId(), savedUserResponse, List.of(), OUT_OF_DOMAIN_REPLY);
             }
 
-            // 6. Build LLM prompts from retrieved context + question
-            String systemPrompt = chatPromptBuilder.systemPrompt(repo.getFullName());
-            String userPrompt = chatPromptBuilder.userPrompt(retrievedContext.contextText(), userContent);
-
-            // 7. Stream LLM response to the client (SSE)
-            return chatStreamHandler.stream(
+            // 5. Delegate to ChatStreamHandler for RAG + model call + budget retries
+            //    entirely inside the async SSE executor thread.
+            return chatStreamHandler.streamWithBudgetRetry(
                     session.getId(),
                     savedUserResponse,
-                    retrievedContext.citations(),
-                    systemPrompt,
-                    userPrompt);
+                    codeContextRetriever,
+                    chatPromptBuilder,
+                    repo.getId(),
+                    repo.getFullName(),
+                    userContent);
         } catch (Exception ex) {
             // Delivery via SSE so the frontend sees an in-chat error instead of a 500 toast.
             String safeMsg = "Sorry, I ran into an issue: "
