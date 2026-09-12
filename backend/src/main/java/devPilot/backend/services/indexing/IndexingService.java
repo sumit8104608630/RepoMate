@@ -7,7 +7,6 @@ import java.util.Map;
 import java.util.UUID;
 
 import org.springframework.stereotype.Service;
-
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
@@ -63,7 +62,7 @@ public class IndexingService {
     }
 
     @Async("indexingExecutor")
-    public void indexAsync(UUID repoId, UUID userId) {
+     public void indexAsync(UUID repoId, UUID userId) {
         try {
             doIndex(repoId, userId);
         } catch (Exception ex) {
@@ -72,7 +71,8 @@ public class IndexingService {
         }
     }
 
-    private void doIndex(UUID repoId, UUID userId) {
+
+      private void doIndex(UUID repoId, UUID userId) {
         Repository repo = repositoryRepository.findById(repoId)
                 .orElseThrow(() -> new NotFoundException("Repository not found"));
         String token = userService.decryptAccessToken(userService.requiredById(userId));
@@ -99,7 +99,6 @@ public class IndexingService {
                 if (batch.size() >= VECTOR_BATCH_SIZE) {
                     vectorStore.add(batch);
                     batch.clear();
-                    rateLimiter.pause();
                 }
             } catch (Exception ex) {
                 log.warn("Skipping file {} in {}: {}", path, repo.getFullName(), ex.getMessage());
@@ -114,13 +113,13 @@ public class IndexingService {
 
         if (!batch.isEmpty()) {
             vectorStore.add(batch);
-            rateLimiter.pause();
         }
 
         markReady(repoId, filePaths.size(), processed, totalChunks, repo.getFullName());
     }
 
-    @SuppressWarnings("unchecked")
+
+       @SuppressWarnings("unchecked")
     private List<String> listIndexableFiles(Map<String, Object> tree) {
         if (tree == null || tree.get("tree") == null) {
             return List.of();
@@ -138,16 +137,16 @@ public class IndexingService {
                 .toList();
     }
 
-    private void deleteExistingVectors(String repoId) {
+     private void deleteExistingVectors(String repoId) {
         try {
             var filter = new FilterExpressionBuilder().eq(RagSettings.METADATA_REPO_ID, repoId).build();
             vectorStore.delete(filter);
         } catch (Exception ex) {
             log.warn("Could not delete existing vectors for repo {}: {}", repoId, ex.getMessage());
         }
-    }
+    };
 
-    @Transactional
+      @Transactional
     protected void updateProgress(
             UUID repoId,
             int total,
@@ -166,7 +165,7 @@ public class IndexingService {
         });
     }
 
-    @Transactional
+      @Transactional
     protected void markReady(UUID repoId, int totalFiles, int processedFiles, int totalChunks, String fullName) {
         repositoryRepository.findById(repoId).ifPresent(repo -> {
             repo.setIndexStatus(IndexStatus.READY);
@@ -181,7 +180,7 @@ public class IndexingService {
         log.info("Indexed {} files ({} chunks) for {}", processedFiles, totalChunks, fullName);
     }
 
-    @Transactional
+     @Transactional
     protected void markFailed(UUID repoId, String message) {
         repositoryRepository.findById(repoId).ifPresent(repo -> {
             repo.setIndexStatus(IndexStatus.FAILED);
