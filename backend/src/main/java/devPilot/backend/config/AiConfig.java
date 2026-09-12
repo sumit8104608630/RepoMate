@@ -44,8 +44,8 @@ public class AiConfig {
 
     private static final Logger log = LoggerFactory.getLogger(AiConfig.class);
 
-    private static final String DEFAULT_EMBEDDING_MODEL = "nvidia/nemotron-3-embed-1b:free";
-    private static final int DEFAULT_EMBEDDING_DIMENSIONS = 2048;
+    private static final String DEFAULT_EMBEDDING_MODEL = "liquid/lfm-2.5-embedding-350m:free";
+    private static final int DEFAULT_EMBEDDING_DIMENSIONS = 1024;
 
     private static String mask(String key) {
         if (key == null || key.isEmpty()) return "<EMPTY>";
