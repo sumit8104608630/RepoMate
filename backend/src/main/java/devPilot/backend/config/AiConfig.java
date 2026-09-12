@@ -1,6 +1,8 @@
 package devPilot.backend.config;
 
 import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,10 +33,12 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.util.StringUtils;
 import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.client.RestClient;
 
 import reactor.core.publisher.Flux;
@@ -151,6 +155,87 @@ public class AiConfig {
         return ex;
     }
 
+    @FunctionalInterface
+    private interface RequestSupplier<T> {
+        T execute() throws HttpClientErrorException, HttpServerErrorException;
+    }
+
+    private static long retryAfterMs(HttpStatusCode status, HttpHeaders headers, int attempt) {
+        long fallbackMs = 4000L * Math.min(1L << Math.max(0, attempt - 1), 60L);
+        if (status == HttpStatus.TOO_MANY_REQUESTS && headers != null) {
+            List<String> resetList = headers.get("X-RateLimit-Reset");
+            if (resetList != null && !resetList.isEmpty()) {
+                try {
+                    long resetEpochMs = Long.parseLong(resetList.get(0).trim());
+                    long waitMs = resetEpochMs - Instant.now().toEpochMilli() + 250L;
+                    if (waitMs > 0) return Math.min(waitMs, 120_000L);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            List<String> retryAfterList = headers.get("Retry-After");
+            if (retryAfterList != null && !retryAfterList.isEmpty()) {
+                try {
+                    long secs = Long.parseLong(retryAfterList.get(0).trim());
+                    return Math.min((secs * 1000L) + 250L, 120_000L);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            return Math.max(fallbackMs, 4000L);
+        }
+        if (status != null && status.is5xxServerError()) {
+            return Math.min(fallbackMs, 15_000L);
+        }
+        return fallbackMs;
+    }
+
+    private static <T> T executeWithRetry(Logger log, String endpoint, RequestSupplier<T> supplier) {
+        int maxAttempts = 8;
+        HttpClientErrorException lastHttpErr = null;
+        HttpServerErrorException lastServerErr = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return supplier.execute();
+            } catch (HttpClientErrorException ex) {
+                lastHttpErr = ex;
+                HttpStatusCode status = ex.getStatusCode();
+                if (status == HttpStatus.TOO_MANY_REQUESTS) {
+                    long wait = retryAfterMs(status, ex.getResponseHeaders(), attempt);
+                    log.warn("executeWithRetry[{}]: got 429 Too Many Requests on attempt={}/{}; sleeping {}ms then retrying. Body preview: {}",
+                            endpoint, attempt, maxAttempts, wait,
+                            ex.getResponseBodyAsString().length() > 220
+                                    ? ex.getResponseBodyAsString().substring(0, 220)
+                                    : ex.getResponseBodyAsString());
+                    sleepMs(wait);
+                    continue;
+                }
+                throw ex;
+            } catch (HttpServerErrorException ex) {
+                lastServerErr = ex;
+                if (attempt >= maxAttempts) throw ex;
+                long wait = retryAfterMs(ex.getStatusCode(), ex.getResponseHeaders(), attempt);
+                log.warn("executeWithRetry[{}]: got {} on attempt={}/{}; sleeping {}ms then retrying. Body preview: {}",
+                        endpoint, ex.getStatusCode(), attempt, maxAttempts, wait,
+                        ex.getResponseBodyAsString().length() > 220
+                                ? ex.getResponseBodyAsString().substring(0, 220)
+                                : ex.getResponseBodyAsString());
+                sleepMs(wait);
+            }
+        }
+        if (lastHttpErr != null) throw lastHttpErr;
+        if (lastServerErr != null) throw lastServerErr;
+        throw new RuntimeException("executeWithRetry[" + endpoint + "]: no response, no captured error");
+    }
+
+    private static void sleepMs(long ms) {
+        if (ms <= 0) return;
+        try {
+            Thread.sleep(Duration.ofMillis(ms));
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted during backoff sleep", ie);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static final class OpenRouterEmbeddingModel implements EmbeddingModel {
 
@@ -187,15 +272,15 @@ public class AiConfig {
                         model, inputs.size(), shouldSendDimensions(), dimensions);
             }
 
-            Map<String, Object> payload;
-            try {
-                payload = client.post()
-                        .uri("/embeddings")
-                        .body(body)
-                        .retrieve()
-                        .body(new ParameterizedTypeReference<Map<String, Object>>() {});
-            } catch (HttpClientErrorException ex) {
-                throw translateOpenRouter(ex, "POST /embeddings (model=" + model + ")");
+            String endpoint = "POST /embeddings (model=" + model + ", inputs=" + inputs.size() + ")";
+            Map<String, Object> payload = executeWithRetry(log, endpoint, () ->
+                    client.post()
+                            .uri("/embeddings")
+                            .body(body)
+                            .retrieve()
+                            .body(new ParameterizedTypeReference<Map<String, Object>>() {}));
+            if (payload == null) {
+                throw new RuntimeException("OpenRouterEmbeddingModel.call: empty response payload from " + endpoint);
             }
 
             List<Object> data = (List<Object>) payload.get("data");
@@ -340,11 +425,16 @@ public class AiConfig {
                 try {
                     log.info("OpenRouterChatModel.call: attempt={}/{} max_tokens={}, model={}",
                             attempt + 1, retryCaps.length, cap, model);
-                    Map<String, Object> payload = client.post()
-                            .uri("/chat/completions")
-                            .body(body)
-                            .retrieve()
-                            .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+                    String chatEndpoint = "POST /chat/completions (model=" + model + ", cap=" + cap + ")";
+                    Map<String, Object> payload = executeWithRetry(log, chatEndpoint, () ->
+                            client.post()
+                                    .uri("/chat/completions")
+                                    .body(body)
+                                    .retrieve()
+                                    .body(new ParameterizedTypeReference<Map<String, Object>>() {}));
+                    if (payload == null) {
+                        throw new RuntimeException("OpenRouterChatModel.call: empty response payload at cap=" + cap);
+                    }
 
                     List<Object> choices = (List<Object>) payload.getOrDefault("choices", List.of());
                     List<Generation> generations = new ArrayList<>(choices.size());

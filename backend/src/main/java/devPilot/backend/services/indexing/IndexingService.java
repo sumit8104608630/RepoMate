@@ -99,6 +99,7 @@ public class IndexingService {
                 if (batch.size() >= VECTOR_BATCH_SIZE) {
                     vectorStore.add(batch);
                     batch.clear();
+                    rateLimiter.pause();
                 }
             } catch (Exception ex) {
                 log.warn("Skipping file {} in {}: {}", path, repo.getFullName(), ex.getMessage());
@@ -113,6 +114,7 @@ public class IndexingService {
 
         if (!batch.isEmpty()) {
             vectorStore.add(batch);
+            rateLimiter.pause();
         }
 
         markReady(repoId, filePaths.size(), processed, totalChunks, repo.getFullName());
