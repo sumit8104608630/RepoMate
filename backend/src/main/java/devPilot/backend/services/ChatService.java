@@ -88,6 +88,10 @@ public class ChatService {
                 .orElseThrow(() -> new NotFoundException("Chat session not found"));
     }
 
+    private static final String GREETING_INPUT = "hii";
+    private static final String GREETING_REPLY = "hii iam repomate how ca i help you";
+    private static final String OUT_OF_DOMAIN_REPLY = "it is out of domain";
+
     public SseEmitter streamReply(UUID userId, UUID sessionId, String userContent) {
         // 1. Ensure the session exists and the repo is indexed
         ChatSession session = requireSession(userId, sessionId);
@@ -103,20 +107,49 @@ public class ChatService {
                 .content(userContent)
                 .build());
 
-        // 3. RAG retrieval — find code chunks similar to the question
-        var retrievedContext = codeContextRetriever.retrieve(repo.getId(), userContent);
+        ChatMessageResponse userResp = toMessageResponse(userMessage);
 
-        // 4. Build LLM prompts from retrieved context + question
-        String systemPrompt = chatPromptBuilder.systemPrompt(repo.getFullName());
-        String userPrompt = chatPromptBuilder.userPrompt(retrievedContext.contextText(), userContent);
+        // 3. Short-circuit: exact greeting (hard constraint)
+        if (GREETING_INPUT.equalsIgnoreCase((userContent == null ? "" : userContent).trim())) {
+            return chatStreamHandler.sendFixedReply(
+                    session.getId(), userResp, List.of(), GREETING_REPLY);
+        }
 
-        // 5. Stream OpenAI response to the client (SSE)
-        return chatStreamHandler.stream(
+        // 4. Short-circuit: out-of-domain detection (no code-related keywords + no matches)
+        if (isOutOfDomain(userContent)) {
+            return chatStreamHandler.sendFixedReply(
+                    session.getId(), userResp, List.of(), OUT_OF_DOMAIN_REPLY);
+        }
+
+        // 5. Stream LLM response WITH progressive budget shrinking.
+        //    If a 402 INPUT token limit occurs, streamWithBudgetRetry() will automatically
+        //    retry with smaller context windows (topK=3→2→1→0 and chars/chunk shrinking)
+        //    before giving up with a user-friendly error.
+        return chatStreamHandler.streamWithBudgetRetry(
                 session.getId(),
-                toMessageResponse(userMessage),
-                retrievedContext.citations(),
-                systemPrompt,
-                userPrompt);
+                userResp,
+                codeContextRetriever,
+                chatPromptBuilder,
+                repo.getId(),
+                repo.getFullName(),
+                userContent);
+    }
+
+    private static boolean isOutOfDomain(String userContent) {
+        if (userContent == null) return true;
+        String q = userContent.trim().toLowerCase();
+        if (q.isEmpty()) return true;
+        String[] codeKeywords = {
+                "code", "file", "class", "function", "method", "variable", "bug", "error",
+                "line", "fix", "implement", "refactor", "explain", "what does", "how does",
+                "where", "find", "search", "repository", "repo", "import", "return",
+                "compile", "runtime", "exception", "stack", "debug", "test", "library",
+                "package", "module", "config", "setup", "build", "deploy", "api"
+        };
+        for (String kw : codeKeywords) {
+            if (q.contains(kw)) return false;
+        }
+        return true;
     }
 
     private ChatSessionResponse toSessionResponse(ChatSession session) {

@@ -260,6 +260,16 @@ public class AiConfig {
         @Override
         public EmbeddingResponse call(EmbeddingRequest request) {
             List<String> inputs = new ArrayList<>(request.getInstructions());
+            if (inputs.isEmpty()) return new EmbeddingResponse(List.of());
+            return callBatched(inputs, 0);
+        }
+
+        private EmbeddingResponse callBatched(List<String> inputs, int recursionDepth) {
+            if (recursionDepth > 5) {
+                throw new RuntimeException("OpenRouterEmbeddingModel.callBatched: recursion depth exceeded. "
+                        + "Last attempted batch size=" + inputs.size());
+            }
+
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);
             body.put("input", inputs.size() == 1 ? inputs.get(0) : inputs);
@@ -268,21 +278,77 @@ public class AiConfig {
             }
 
             if (log.isInfoEnabled()) {
-                log.info("OpenRouterEmbeddingModel.call: model={}, inputCount={}, sendDimensions={}, configuredDimensions={}",
-                        model, inputs.size(), shouldSendDimensions(), dimensions);
+                log.info("OpenRouterEmbeddingModel.callBatched: depth={}, model={}, inputCount={}",
+                        recursionDepth, model, inputs.size());
             }
 
             String endpoint = "POST /embeddings (model=" + model + ", inputs=" + inputs.size() + ")";
-            Map<String, Object> payload = executeWithRetry(log, endpoint, () ->
-                    client.post()
-                            .uri("/embeddings")
-                            .body(body)
-                            .retrieve()
-                            .body(new ParameterizedTypeReference<Map<String, Object>>() {}));
-            if (payload == null) {
-                throw new RuntimeException("OpenRouterEmbeddingModel.call: empty response payload from " + endpoint);
+            try {
+                Map<String, Object> payload = executeWithRetry(log, endpoint, () ->
+                        client.post()
+                                .uri("/embeddings")
+                                .body(body)
+                                .retrieve()
+                                .body(new ParameterizedTypeReference<Map<String, Object>>() {}));
+                if (payload == null) {
+                    throw new RuntimeException("OpenRouterEmbeddingModel.callBatched: empty response payload at depth=" + recursionDepth);
+                }
+                return parseEmbeddingResponse(payload);
+            } catch (HttpClientErrorException ex) {
+                HttpStatus status = HttpStatus.resolve(ex.getStatusCode().value());
+                if (status == HttpStatus.PAYMENT_REQUIRED) {
+                    String bodyStr = ex.getResponseBodyAsString();
+                    boolean isInputLimit = bodyStr.contains("Prompt tokens limit exceeded")
+                            || bodyStr.contains("credit") || bodyStr.contains("balance");
+                    if (isInputLimit && inputs.size() > 1) {
+                        // Split batch in half, recurse on each half, then re-index & merge
+                        log.warn("OpenRouterEmbeddingModel.callBatched: 402 PAYMENT_REQUIRED on batch size={} depth={}. "
+                                        + "Splitting in half. Body preview: {}",
+                                inputs.size(), recursionDepth,
+                                bodyStr.length() > 200 ? bodyStr.substring(0, 200) : bodyStr);
+                        return splitAndRecurse(inputs, recursionDepth);
+                    }
+                    if (isInputLimit && inputs.size() == 1) {
+                        String msg = "OpenRouter returned 402 on a SINGLE embedding input. "
+                                + "This document is too large for your credit balance.\n"
+                                + "  Fix options:\n"
+                                + "    1. Add credits at https://openrouter.ai/settings/credits\n"
+                                + "    2. Reduce app.indexing.chunk-size in application.properties\n"
+                                + "  Raw error: " + (bodyStr.length() > 500 ? bodyStr.substring(0, 500) : bodyStr);
+                        log.error(msg);
+                        throw new RuntimeException(msg, ex);
+                    }
+                    // Output-cap 402 (rare for embeddings) or non-credit 402 — rethrow with hint
+                    String hint = "OpenRouter returned 402 Payment Required on embeddings.\n"
+                            + "  Quickest fix: add credits at https://openrouter.ai/settings/credits\n"
+                            + "  Raw response: " + (bodyStr.length() > 500 ? bodyStr.substring(0, 500) : bodyStr);
+                    log.error(hint);
+                    throw new RuntimeException(hint, ex);
+                }
+                throw translateOpenRouter(ex, endpoint);
             }
+        }
 
+        private EmbeddingResponse splitAndRecurse(List<String> inputs, int recursionDepth) {
+            int mid = inputs.size() / 2;
+            List<String> left = inputs.subList(0, mid);
+            List<String> right = inputs.subList(mid, inputs.size());
+
+            EmbeddingResponse leftRes = callBatched(new ArrayList<>(left), recursionDepth + 1);
+            EmbeddingResponse rightRes = callBatched(new ArrayList<>(right), recursionDepth + 1);
+
+            List<Embedding> merged = new ArrayList<>(leftRes.getResults().size() + rightRes.getResults().size());
+            for (Embedding e : leftRes.getResults()) {
+                merged.add(e);
+            }
+            int leftSize = left.size();
+            for (Embedding e : rightRes.getResults()) {
+                merged.add(new Embedding(e.getOutput(), leftSize + e.getIndex()));
+            }
+            return new EmbeddingResponse(merged);
+        }
+
+        private EmbeddingResponse parseEmbeddingResponse(Map<String, Object> payload) {
             List<Object> data = (List<Object>) payload.get("data");
             List<Embedding> embeddings = new ArrayList<>(data.size());
             for (Object item : data) {

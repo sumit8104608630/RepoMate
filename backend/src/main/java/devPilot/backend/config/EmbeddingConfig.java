@@ -12,6 +12,6 @@ public class EmbeddingConfig {
 
     @Bean
     public BatchingStrategy batchingStrategy() {
-        return new TokenCountBatchingStrategy(EncodingType.CL100K_BASE, 3000, 0.1);
+        return new TokenCountBatchingStrategy(EncodingType.CL100K_BASE, 1000, 0.1);
     }
 }
