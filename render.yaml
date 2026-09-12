@@ -26,6 +26,8 @@ services:
           property: password
       - key: SERVER_PORT
         value: "8081"
+      - key: JAVA_TOOL_OPTIONS
+        value: "-Xms256m -Xmx1g -XX:+UseSerialGC -Dfile.encoding=UTF-8"
       - key: SERVER_FORWARD_HEADERS_STRATEGY
         value: "native"
       - key: SERVER_SERVLET_SESSION_COOKIE_SECURE

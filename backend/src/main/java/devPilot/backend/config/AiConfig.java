@@ -44,8 +44,8 @@ public class AiConfig {
 
     private static final Logger log = LoggerFactory.getLogger(AiConfig.class);
 
-    private static final String DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small";
-    private static final int DEFAULT_EMBEDDING_DIMENSIONS = 1536;
+    private static final String DEFAULT_EMBEDDING_MODEL = "nvidia/nemotron-3-embed-1b:free";
+    private static final int DEFAULT_EMBEDDING_DIMENSIONS = 2048;
 
     private static String mask(String key) {
         if (key == null || key.isEmpty()) return "<EMPTY>";
@@ -99,7 +99,7 @@ public class AiConfig {
         String trimmedBase = StringUtils.trimTrailingCharacter(baseUrl, '/');
         log.info("OpenRouter RestClient: baseUrl={}, referer={}, title={}, keyPrefix={}",
                 trimmedBase, referer, title, mask(resolvedKey));
-        validateKey(resolvedKey, DEFAULT_EMBEDDING_MODEL + " / openai/gpt-4o-mini");
+        validateKey(resolvedKey, DEFAULT_EMBEDDING_MODEL + " / nvidia/nemotron-3.5-lightning:free");
         return RestClient.builder()
                 .baseUrl(trimmedBase)
                 .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + resolvedKey)
@@ -164,13 +164,28 @@ public class AiConfig {
             this.dimensions = dimensions;
         }
 
+        private boolean shouldSendDimensions() {
+            if (model == null) return false;
+            String m = model.toLowerCase();
+            if (m.contains("nvidia/") || m.contains("nemotron")) return false;
+            if (m.startsWith("liquid/")) return false;
+            return dimensions > 0;
+        }
+
         @Override
         public EmbeddingResponse call(EmbeddingRequest request) {
             List<String> inputs = new ArrayList<>(request.getInstructions());
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("model", model);
             body.put("input", inputs.size() == 1 ? inputs.get(0) : inputs);
-            body.put("dimensions", dimensions);
+            if (shouldSendDimensions()) {
+                body.put("dimensions", dimensions);
+            }
+
+            if (log.isInfoEnabled()) {
+                log.info("OpenRouterEmbeddingModel.call: model={}, inputCount={}, sendDimensions={}, configuredDimensions={}",
+                        model, inputs.size(), shouldSendDimensions(), dimensions);
+            }
 
             Map<String, Object> payload;
             try {
