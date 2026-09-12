@@ -139,12 +139,35 @@ public class ChatService {
         if (userContent == null) return true;
         String q = userContent.trim().toLowerCase();
         if (q.isEmpty()) return true;
+
+        // Short queries (<= 100 chars) are ALWAYS allowed through.
+        // Why? Because abbreviated code questions like "what does f do",
+        // "explain t", or "bug?" don't contain literal keywords like "class" or "file",
+        // but they ARE in-domain once RAG contextualises them.
+        // The 7-level budget ladder + zero-RAG fallback handles them safely on 402,
+        // so false negatives here have no downside — but false positives (the screenshot
+        // showing "what does do f" → "it is out of domain") ruin the UX.
+        if (q.length() <= 100) return false;
+
         String[] codeKeywords = {
+                // Core dev terms
                 "code", "file", "class", "function", "method", "variable", "bug", "error",
                 "line", "fix", "implement", "refactor", "explain", "what does", "how does",
                 "where", "find", "search", "repository", "repo", "import", "return",
                 "compile", "runtime", "exception", "stack", "debug", "test", "library",
-                "package", "module", "config", "setup", "build", "deploy", "api"
+                "package", "module", "config", "setup", "build", "deploy", "api",
+                // Question starters / common verbs (long queries without ANY of these are
+                // almost never code-related)
+                "what", "how", "why", "when", "where", "which", "who",
+                "define", "describe", "help", "show", "list", "tell", "mean",
+                "can", "could", "should", "would", "will", "do", "does", "is", "are",
+                // Code syntax / punctuation hints
+                "()", "{", "}", "//", "/*", "*/", ".java", ".ts", ".js", ".py", ".rs",
+                ".cpp", ".cs", ".go", ".php", ".rb", ".sql", ".html", ".css",
+                // Misc common dev phrases
+                "this line", "this function", "this method", "this class", "this file",
+                "the error", "the code", "the repo", "crash", "fail", "warning", "null",
+                "trace", "log", "console", "terminal", "command", "script", "docker"
         };
         for (String kw : codeKeywords) {
             if (q.contains(kw)) return false;

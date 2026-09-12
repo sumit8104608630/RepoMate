@@ -93,6 +93,9 @@ public class IndexingService {
             try {
                 String content = gitHubApiClient.getFileContent(
                         token, repo.getOwner(), repo.getName(), path);
+                // Pause ONLY after a successful GitHub API content fetch.
+                // Skipped files and exception paths don't burn API budget, so no delay needed.
+                rateLimiter.pause();
                 List<Document> chunks = codeChunker.chunkFile(repoId.toString(), path, content);
                 batch.addAll(chunks);
                 totalChunks += chunks.size();
@@ -108,7 +111,6 @@ public class IndexingService {
             if (processed % PROGRESS_EVERY_N_FILES == 0 || processed == filePaths.size()) {
                 updateProgress(repoId, filePaths.size(), processed, totalChunks, IndexStatus.INDEXING, null);
             }
-            rateLimiter.pause();
         }
 
         if (!batch.isEmpty()) {
