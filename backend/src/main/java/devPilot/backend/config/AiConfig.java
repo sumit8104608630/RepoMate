@@ -95,23 +95,91 @@ public class AiConfig {
 
     @Bean(name = "openRouterRestClient")
     RestClient openRouterRestClient(
+            org.springframework.core.env.Environment env,
             @Value("${spring.ai.openai.base-url:https://openrouter.ai/api/v1}") String baseUrl,
             @Value("${spring.ai.openai.api-key:}") String apiKey,
             @Value("${app.openrouter.referer:https://repomate-bfie.onrender.com}") String referer,
             @Value("${app.openrouter.title:DevPilot}") String title) {
-        String resolvedKey = resolveApiKey(apiKey);
+        // Dynamic Authorization header supplier — resolves the key FRESH on EVERY request,
+        // not just once at bean creation. This eliminates the "stale cached key" class of bugs
+        // where a user changes OPENROUTER_API_KEY in Render env (or restarts the pod) but some
+        // singleton bean still holds an old Bearer token forever. It also means that any
+        // future runtime config refresh mechanism will be picked up without code changes.
+        java.util.function.Supplier<String> liveKeySupplier = () -> {
+            String prop = env.getProperty("spring.ai.openai.api-key", "");
+            String resolved = resolveApiKey(prop);
+            return resolved;
+        };
         String trimmedBase = StringUtils.trimTrailingCharacter(baseUrl, '/');
-        log.info("OpenRouter RestClient: baseUrl={}, referer={}, title={}, keyPrefix={}",
-                trimmedBase, referer, title, mask(resolvedKey));
-        validateKey(resolvedKey, DEFAULT_EMBEDDING_MODEL + " / nvidia/nemotron-3.5-lightning:free");
+        String startupKey = resolveApiKey(apiKey);
+        log.info("OpenRouter RestClient: baseUrl={}, referer={}, title={}, startup-keyPrefix={}",
+                trimmedBase, referer, title, mask(startupKey));
+        validateKey(startupKey, DEFAULT_EMBEDDING_MODEL + " / nvidia/nemotron-3.5-lightning:free");
+        bestEffortValidateKeyQuota(startupKey, referer, title);
         return RestClient.builder()
                 .baseUrl(trimmedBase)
-                .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + resolvedKey)
-                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
-                .defaultHeader("HTTP-Referer", referer)
-                .defaultHeader("X-Title", title)
+                .requestInitializer(request -> {
+                    String live = liveKeySupplier.get();
+                    if (live != null && !live.isEmpty()) {
+                        request.getHeaders().set(HttpHeaders.AUTHORIZATION, "Bearer " + live);
+                    }
+                    request.getHeaders().set(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE);
+                    request.getHeaders().set("HTTP-Referer", referer);
+                    request.getHeaders().set("X-Title", title);
+                })
                 .requestFactory(new JdkClientHttpRequestFactory())
                 .build();
+    }
+
+    /** Exposed so debug endpoints / health checks can see which key prefix is LIVE, */
+    @Bean(name = "openRouterKeyPrefixProvider")
+    java.util.function.Supplier<String> openRouterKeyPrefixProvider(
+            org.springframework.core.env.Environment env,
+            @Value("${spring.ai.openai.api-key:}") String apiKey) {
+        return () -> mask(resolveApiKey(apiKey != null && !apiKey.startsWith("${")
+                ? apiKey
+                : env.getProperty("spring.ai.openai.api-key", "")));
+    }
+
+    private static void bestEffortValidateKeyQuota(String key, String referer, String title) {
+        if (key == null || key.isEmpty()) return;
+        try {
+            RestClient probe = RestClient.builder()
+                    .baseUrl("https://openrouter.ai/api/v1")
+                    .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + key)
+                    .defaultHeader("HTTP-Referer", referer)
+                    .defaultHeader("X-Title", title)
+                    .requestFactory(new JdkClientHttpRequestFactory())
+                    .build();
+            Map<String, Object> resp = probe.get()
+                    .uri("/auth/key")
+                    .retrieve()
+                    .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+            if (resp == null || resp.get("data") == null) return;
+            @SuppressWarnings("unchecked")
+            Map<String, Object> data = (Map<String, Object>) resp.get("data");
+            Object freeTier = data.get("is_free_tier");
+            Object limit = data.get("limit");
+            Object usage = data.get("usage");
+            Object limitRemaining = data.get("limit_remaining");
+            Object usageDaily = data.get("usage_daily");
+            log.info("OpenRouter key /v1/auth/key snapshot: is_free_tier={}, limit(cents)={}, usage(cents)={}, limit_remaining={}, usage_daily={}",
+                    freeTier, limit, usage, limitRemaining, usageDaily);
+            if (Boolean.TRUE.equals(freeTier)) {
+                log.warn("OPENROUTER KEY IS ON FREE TIER (no paid credits added). "
+                        + "This account is subject to the 50 free-model requests/day cap. "
+                        + "Embedding a single medium-sized repo (50+ files × 2 chunks = 100 embedding batches) "
+                        + "WILL EXCEED THE CAP and indexing will fail.\n"
+                        + "  -> Fix: Add $10 (1000 cents) at https://openrouter.ai/settings/credits\n"
+                        + "     This raises free-model daily limit from 50 -> 1000 requests/day (20x increase)\n"
+                        + "     AND enables paid models which have NO free-tier quota.\n"
+                        + "  -> Alternative: Configure non-free embedding/chat models via "
+                        + "     spring.ai.openai.embedding.options.model, spring.ai.openai.chat.options.model");
+            }
+        } catch (Exception ex) {
+            log.info("OpenRouter key startup quota probe skipped (non-fatal, best-effort only). Cause: {} - {}",
+                    ex.getClass().getSimpleName(), ex.getMessage());
+        }
     }
 
     @Primary
