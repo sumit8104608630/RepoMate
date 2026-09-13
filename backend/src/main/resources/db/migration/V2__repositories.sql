@@ -27,16 +27,29 @@ CREATE INDEX IF NOT EXISTS idx_repositories_user_id ON repositories(user_id);
 CREATE INDEX IF NOT EXISTS idx_repositories_github_repo_id ON repositories(github_repo_id);
 CREATE INDEX IF NOT EXISTS idx_repositories_full_name ON repositories(full_name);
 CREATE INDEX IF NOT EXISTS idx_repositories_index_status ON repositories(index_status);
-
 DO $$
+DECLARE
+    idx RECORD;
 BEGIN
     IF EXISTS (
         SELECT 1
         FROM information_schema.tables
         WHERE table_schema = 'public' AND table_name = 'vector_store'
     ) THEN
-        ALTER TABLE IF EXISTS vector_store
+        FOR idx IN
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'vector_store'
+              AND indexdef ILIKE '%embedding%'
+        LOOP
+            EXECUTE 'DROP INDEX IF EXISTS public.' || quote_ident(idx.indexname);
+        END LOOP;
+
+        ALTER TABLE public.vector_store
             ALTER COLUMN embedding TYPE vector(2048)
             USING embedding::vector(2048);
+
+        -- No index for now — plain sequential scan, works regardless of dimension
     END IF;
 END $$;
