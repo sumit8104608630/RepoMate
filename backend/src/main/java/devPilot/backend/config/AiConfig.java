@@ -160,15 +160,61 @@ public class AiConfig {
         T execute() throws HttpClientErrorException, HttpServerErrorException;
     }
 
-    private static long retryAfterMs(HttpStatusCode status, HttpHeaders headers, int attempt) {
+    private static final long NO_RETRY_SENTINEL_MS = Long.MAX_VALUE;
+    private static final long MAX_RETRY_WAIT_MS = 5L * 60L * 1000L;
+
+    private static boolean isDailyQuotaExhausted(HttpClientErrorException ex) {
+        if (ex == null) return false;
+        String body = ex.getResponseBodyAsString();
+        if (body == null || body.isEmpty()) return false;
+        // OpenRouter adds "limit_source":"openrouter_free_tier_daily" when the 50/day free cap is hit.
+        // Retrying this is pointless; the X-RateLimit-Reset is typically HOURS away.
+        return body.contains("openrouter_free_tier_daily")
+                || body.contains("free-models-per-day");
+    }
+
+    private static String extractRemedyHint(HttpClientErrorException ex) {
+        if (ex == null) return "";
+        String body = ex.getResponseBodyAsString();
+        if (body == null || body.isEmpty()) return "";
+        // Prefer OpenRouter's own hint if present.
+        int i = body.indexOf("remedy_hint");
+        if (i > 0) {
+            int start = body.indexOf('"', i);
+            if (start > 0) {
+                int end = body.indexOf('"', start + 1);
+                if (end > start) return body.substring(start + 1, end);
+            }
+        }
+        // Otherwise pull the top-level error.message.
+        int m = body.indexOf("\"message\":\"");
+        if (m > 0) {
+            int end = body.indexOf("\"", m + 11);
+            if (end > m) return body.substring(m + 11, end);
+        }
+        return body.length() > 200 ? body.substring(0, 200) : body;
+    }
+
+    private static long retryAfterMs(HttpStatusCode status, HttpHeaders headers, int attempt, HttpClientErrorException ex) {
+        // Daily free-tier quota: never retry — reset is ~24h away, NOT seconds.
+        if (isDailyQuotaExhausted(ex)) return NO_RETRY_SENTINEL_MS;
+
         long fallbackMs = 4000L * Math.min(1L << Math.max(0, attempt - 1), 60L);
         if (status == HttpStatus.TOO_MANY_REQUESTS && headers != null) {
             List<String> resetList = headers.get("X-RateLimit-Reset");
             if (resetList != null && !resetList.isEmpty()) {
                 try {
-                    long resetEpochMs = Long.parseLong(resetList.get(0).trim());
+                    String raw = resetList.get(0).trim();
+                    long resetVal = Long.parseLong(raw);
+                    long resetEpochMs;
+                    // Heuristic: seconds vs ms. 10-digit numbers are seconds; 13-digit are ms (Unix epoch).
+                    if (raw.length() <= 10) resetEpochMs = resetVal * 1000L;
+                    else resetEpochMs = resetVal;
                     long waitMs = resetEpochMs - Instant.now().toEpochMilli() + 250L;
-                    if (waitMs > 0) return Math.min(waitMs, 120_000L);
+                    // If the platform tells us to wait > 5 minutes, it's an hourly/daily quota,
+                    // not a transient spike. Give up instead of blocking the thread for ages.
+                    if (waitMs > MAX_RETRY_WAIT_MS) return NO_RETRY_SENTINEL_MS;
+                    if (waitMs > 0) return Math.min(waitMs, MAX_RETRY_WAIT_MS);
                 } catch (NumberFormatException ignored) {
                 }
             }
@@ -176,7 +222,9 @@ public class AiConfig {
             if (retryAfterList != null && !retryAfterList.isEmpty()) {
                 try {
                     long secs = Long.parseLong(retryAfterList.get(0).trim());
-                    return Math.min((secs * 1000L) + 250L, 120_000L);
+                    long waitMs = (secs * 1000L) + 250L;
+                    if (waitMs > MAX_RETRY_WAIT_MS) return NO_RETRY_SENTINEL_MS;
+                    return waitMs;
                 } catch (NumberFormatException ignored) {
                 }
             }
@@ -189,7 +237,7 @@ public class AiConfig {
     }
 
     private static <T> T executeWithRetry(Logger log, String endpoint, RequestSupplier<T> supplier) {
-        int maxAttempts = 8;
+        int maxAttempts = 3;
         HttpClientErrorException lastHttpErr = null;
         HttpServerErrorException lastServerErr = null;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -199,7 +247,23 @@ public class AiConfig {
                 lastHttpErr = ex;
                 HttpStatusCode status = ex.getStatusCode();
                 if (status == HttpStatus.TOO_MANY_REQUESTS) {
-                    long wait = retryAfterMs(status, ex.getResponseHeaders(), attempt);
+                    long wait = retryAfterMs(status, ex.getResponseHeaders(), attempt, ex);
+                    if (wait == NO_RETRY_SENTINEL_MS) {
+                        String hint = extractRemedyHint(ex);
+                        String msg = "executeWithRetry[" + endpoint + "]: 429 Too Many Requests "
+                                + "but server says NO short retry possible (daily/long quota). "
+                                + "Aborting to avoid blocking the thread.\n"
+                                + "  Hint: " + hint + "\n"
+                                + "  (If you keep seeing this, add 10 USD credits at https://openrouter.ai/settings/credits"
+                                + " to unlock 1000 free model requests/day, or switch to a paid model.)";
+                        log.error(msg);
+                        throw new HttpClientErrorException(
+                                ex.getStatusCode(),
+                                ex.getStatusText() + " [Daily/Long-Quota 429 - not retried]",
+                                ex.getResponseHeaders(),
+                                ex.getResponseBodyAsByteArray(),
+                                null);
+                    }
                     log.warn("executeWithRetry[{}]: got 429 Too Many Requests on attempt={}/{}; sleeping {}ms then retrying. Body preview: {}",
                             endpoint, attempt, maxAttempts, wait,
                             ex.getResponseBodyAsString().length() > 220
@@ -212,7 +276,7 @@ public class AiConfig {
             } catch (HttpServerErrorException ex) {
                 lastServerErr = ex;
                 if (attempt >= maxAttempts) throw ex;
-                long wait = retryAfterMs(ex.getStatusCode(), ex.getResponseHeaders(), attempt);
+                long wait = retryAfterMs(ex.getStatusCode(), ex.getResponseHeaders(), attempt, null);
                 log.warn("executeWithRetry[{}]: got {} on attempt={}/{}; sleeping {}ms then retrying. Body preview: {}",
                         endpoint, ex.getStatusCode(), attempt, maxAttempts, wait,
                         ex.getResponseBodyAsString().length() > 220
