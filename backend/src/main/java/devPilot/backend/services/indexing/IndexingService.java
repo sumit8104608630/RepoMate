@@ -119,6 +119,13 @@ public class IndexingService {
         return false;
     }
 
+    private static String formatDuration(Duration d) {
+        if (d == null) return "0s";
+        long s = d.toSeconds();
+        if (s < 60) return s + "s";
+        return String.format("%dm%02ds", s / 60, s % 60);
+    }
+
     private static RuntimeException wrapFatalIfQuota(Throwable t) {
         String msg = "OpenRouter daily free-model quota (50 requests/day) is exhausted. "
                 + "Indexing cannot continue until the daily reset or until you add credits.\n"

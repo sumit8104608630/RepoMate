@@ -1,5 +1,6 @@
 package devPilot.backend.config;
 
+import java.net.http.HttpClient;
 import java.time.Duration;
 import java.util.concurrent.Executor;
 
@@ -24,8 +25,15 @@ public class AppConfig {
 
     @Bean
     RestClient.Builder restClientBuilder() {
-        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory();
-        factory.setConnectTimeout(CONNECT_TIMEOUT);
+        // Configure timeouts directly via java.net.http.HttpClient.Builder and then
+        // wrap it in JdkClientHttpRequestFactory. This is the only signature compatible
+        // with ALL Spring 6.x versions (avoids build errors from missing
+        // setConnectTimeout(Duration) or the (int,int) constructor overload).
+        HttpClient httpClient = HttpClient.newBuilder()
+                .connectTimeout(CONNECT_TIMEOUT)
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .build();
+        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(httpClient);
         factory.setReadTimeout(READ_TIMEOUT);
         return RestClient.builder().requestFactory(factory);
     }
