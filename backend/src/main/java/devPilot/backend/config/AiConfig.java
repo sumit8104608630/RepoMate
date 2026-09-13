@@ -187,9 +187,11 @@ public class AiConfig {
     EmbeddingModel openRouterEmbeddingModel(
             RestClient openRouterRestClient,
             @Value("${spring.ai.openai.embedding.options.model:" + DEFAULT_EMBEDDING_MODEL + "}") String model,
+            @Value("${app.ai.embedding.fallback-model:openai/text-embedding-3-small}") String fallbackModel,
             @Value("${spring.ai.openai.embedding.options.dimensions:" + DEFAULT_EMBEDDING_DIMENSIONS + "}") int dimensions) {
-        log.info("Registering @Primary OpenRouterEmbeddingModel: model={}, dimensions={}", model, dimensions);
-        return new OpenRouterEmbeddingModel(openRouterRestClient, model, dimensions);
+        log.info("Registering @Primary OpenRouterEmbeddingModel: model={}, fallbackModel={}, dimensions={}",
+                model, fallbackModel, dimensions);
+        return new OpenRouterEmbeddingModel(openRouterRestClient, model, fallbackModel, dimensions);
     }
 
     @Primary
@@ -372,16 +374,33 @@ public class AiConfig {
     private static final class OpenRouterEmbeddingModel implements EmbeddingModel {
 
         private final RestClient client;
-        private final String model;
+        private final String primaryModel;
+        private final String fallbackModel;
         private final int dimensions;
 
-        OpenRouterEmbeddingModel(RestClient client, String model, int dimensions) {
+        // Volatile so it's visible across threads: set to true the FIRST time we hit
+        // openrouter_free_tier_daily 429 on the primary (":free") model. Once set, every
+        // subsequent embedding call for this JVM lifetime uses the paid fallback model.
+        // Paid models on OpenRouter do NOT count against the 50/day free cap — they use
+        // the account's actual credit balance, and raise the free-quota limit from 50
+        // to 1000/day if the account has >=$10 credit.
+        private volatile boolean freeTierDailyQuotaExhausted = false;
+
+        OpenRouterEmbeddingModel(RestClient client, String primaryModel, String fallbackModel, int dimensions) {
             this.client = client;
-            this.model = model;
+            this.primaryModel = primaryModel;
+            this.fallbackModel = fallbackModel == null || fallbackModel.isBlank() ? primaryModel : fallbackModel;
             this.dimensions = dimensions;
         }
 
-        private boolean shouldSendDimensions() {
+        private String activeModel() {
+            if (freeTierDailyQuotaExhausted && !primaryModel.equals(fallbackModel)) {
+                return fallbackModel;
+            }
+            return primaryModel;
+        }
+
+        private boolean shouldSendDimensions(String model) {
             if (model == null) return false;
             String m = model.toLowerCase();
             if (m.contains("nvidia/") || m.contains("nemotron")) return false;
@@ -402,19 +421,20 @@ public class AiConfig {
                         + "Last attempted batch size=" + inputs.size());
             }
 
+            String modelForThisCall = activeModel();
+            String endpoint = "POST /embeddings (model=" + modelForThisCall + ", inputs=" + inputs.size() + ")";
             Map<String, Object> body = new LinkedHashMap<>();
-            body.put("model", model);
+            body.put("model", modelForThisCall);
             body.put("input", inputs.size() == 1 ? inputs.get(0) : inputs);
-            if (shouldSendDimensions()) {
+            if (shouldSendDimensions(modelForThisCall)) {
                 body.put("dimensions", dimensions);
             }
 
             if (log.isInfoEnabled()) {
                 log.info("OpenRouterEmbeddingModel.callBatched: depth={}, model={}, inputCount={}",
-                        recursionDepth, model, inputs.size());
+                        recursionDepth, modelForThisCall, inputs.size());
             }
 
-            String endpoint = "POST /embeddings (model=" + model + ", inputs=" + inputs.size() + ")";
             try {
                 Map<String, Object> payload = executeWithRetry(log, endpoint, () ->
                         client.post()
@@ -428,12 +448,35 @@ public class AiConfig {
                 return parseEmbeddingResponse(payload);
             } catch (HttpClientErrorException ex) {
                 HttpStatus status = HttpStatus.resolve(ex.getStatusCode().value());
+                // Daily free-tier 429: trigger the fallback switch and RETRY THIS BATCH once.
+                if (status == HttpStatus.TOO_MANY_REQUESTS && isDailyQuotaExhausted(ex)) {
+                    boolean switchedToFallback = false;
+                    if (!freeTierDailyQuotaExhausted && !primaryModel.equals(fallbackModel)) {
+                        freeTierDailyQuotaExhausted = true;
+                        switchedToFallback = true;
+                        log.warn("OpenRouterEmbeddingModel: PRIMARY MODEL '{}' HIT DAILY FREE-MODEL QUOTA (50/day). "
+                                        + "PERMANENTLY SWITCHING PROCESS-WIDE TO FALLBACK EMBEDDING MODEL: '{}'. "
+                                        + "This bypasses the 50/day free cap. If the fallback is a paid model and your "
+                                        + "account has any remaining credit balance, indexing will now resume.\n"
+                                        + "  Primary (hit 50/day): {}\n"
+                                        + "  Fallback (now active): {}",
+                                primaryModel, fallbackModel, primaryModel, fallbackModel);
+                    }
+                    // If we just switched, retry this SAME batch ONCE now using the fallback model
+                    // (this is not an infinite loop because freeTierDailyQuotaExhausted is now true,
+                    // activeModel() returns fallback, and the second hit of daily 429 on fallback
+                    // won't trigger switchedToFallback=true again because it's already true).
+                    if (switchedToFallback) {
+                        log.info("OpenRouterEmbeddingModel: retrying batch size={} with fallback model '{}'",
+                                inputs.size(), fallbackModel);
+                        return callBatched(inputs, recursionDepth); // recursion but model changed, count as same-depth.
+                    }
+                }
                 if (status == HttpStatus.PAYMENT_REQUIRED) {
                     String bodyStr = ex.getResponseBodyAsString();
                     boolean isInputLimit = bodyStr.contains("Prompt tokens limit exceeded")
                             || bodyStr.contains("credit") || bodyStr.contains("balance");
                     if (isInputLimit && inputs.size() > 1) {
-                        // Split batch in half, recurse on each half, then re-index & merge
                         log.warn("OpenRouterEmbeddingModel.callBatched: 402 PAYMENT_REQUIRED on batch size={} depth={}. "
                                         + "Splitting in half. Body preview: {}",
                                 inputs.size(), recursionDepth,
@@ -450,7 +493,6 @@ public class AiConfig {
                         log.error(msg);
                         throw new RuntimeException(msg, ex);
                     }
-                    // Output-cap 402 (rare for embeddings) or non-credit 402 — rethrow with hint
                     String hint = "OpenRouter returned 402 Payment Required on embeddings.\n"
                             + "  Quickest fix: add credits at https://openrouter.ai/settings/credits\n"
                             + "  Raw response: " + (bodyStr.length() > 500 ? bodyStr.substring(0, 500) : bodyStr);
